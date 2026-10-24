@@ -100,7 +100,7 @@ __global__ void __launch_bounds__(THREADS) gate_up_kernel(const Batch b, const N
     int fb, e, row0, nrows;
     if (!work_item<BN, GU_NFB>(b, ts, tiles, off, blockIdx.x, fb, e, row0, nrows)) return;
     const int live_tiles = (nrows + 15) / 16;
-    const uint8_t* blob = b.blob[e - b.e0];
+    const uint8_t* blob = b.at(e - b.e0);
     if (tid < BN) srow[tid] = tid < nrows ? src[row0 + tid] : -1;
     __syncthreads();
 
@@ -241,7 +241,7 @@ __global__ void __launch_bounds__(THREADS) down_kernel(const Batch b, const Nati
     if (tid < BN) srow[tid] = tid < nrows ? row0 + tid : -1;   // H is indexed by the routed row
     __syncthreads();
 
-    const uint2* f_ptr = reinterpret_cast<const uint2*>(b.blob[e - b.e0] + geo.down_off + (size_t) (fb * ROWS + (tid >> 1)) * geo.d_row);
+    const uint2* f_ptr = reinterpret_cast<const uint2*>(b.at(e - b.e0) + geo.down_off + (size_t) (fb * ROWS + (tid >> 1)) * geo.d_row);
     uint4 f_codes;
     uint32_t f_high = 0, f_dm = 0;
     ActStage<BN> as;

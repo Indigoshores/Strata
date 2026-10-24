@@ -510,7 +510,7 @@ native_kernel(const Batch b, const NativeGeom geo, const Tables tb, const uint8_
         const int fb = w % NFB, e = tl.x, row0 = tl.y;
         if ((row0 - tb.off[e]) % TR != 0) continue;              // a 64-row tile inside an earlier item's TR rows
         const int nrows = min(TR, tb.off[e + 1] - row0);
-        const uint8_t* blob = b.blob[e - b.e0];
+        const uint8_t* blob = b.at(e - b.e0);
         const int rbase = fb * WR;
         // local row ur: gate/up - feature (WR / 2) fb + 8 (ur >> 4) + (ur & 7), its up row when bit 3 is set
         const uint8_t* wrow = GU ? blob + ((ur & 8) ? geo.up_off : 0) +
@@ -867,7 +867,7 @@ native_w11_kernel(const Batch b, const NativeGeom geo, const Tables tb, const ui
     for (int w = blockIdx.x; w < nwork; w += gridDim.x) {
         const int2 tl = tb.tiles[t0 + w / NFB];
         const int fb = w % NFB, e = tl.x, row0 = tl.y, nrows = min(BM_TILE, tb.off[e + 1] - row0);
-        const uint8_t* blob = b.blob[e - b.e0];
+        const uint8_t* blob = b.at(e - b.e0);
         const int rbase = fb * NW_ROWS;
         const uint8_t* wrow = GU ? blob + ((ur & 1) ? geo.up_off : 0) + (size_t) (fb * (NW_ROWS / 2) + (ur >> 1)) * geo.gu_row
                                  : blob + geo.down_off + (size_t) (rbase + ur) * geo.d_row;
@@ -1116,7 +1116,7 @@ native_f16_kernel(const Batch b, const NativeGeom geo, const Tables tb, const ui
         for (int k = 0; k < 16; ++k) kv[k >> 2] |= (uint32_t) (uint8_t) kvalues_iq4nl[k] << (8 * (k & 3));
     }
     const int live_tiles = (nrows + 15) / 16;
-    const uint8_t* blob = b.blob[e - b.e0];
+    const uint8_t* blob = b.at(e - b.e0);
     if (tid < BN) srow[tid] = tid < nrows ? (GU ? src[row0 + tid] : row0 + tid) : -1;   // tokens; H by routed row
     __syncthreads();
 
@@ -1503,9 +1503,10 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
         uint8_t* ha8 = (uint8_t*) ha;
         const bool f16 = !d.w12 && f16::requested();
         if (!f16 && !d.w12 && moe_var_bm_enabled()) {
-            const int64_t t_cap64 = (n >= 49) ? ((n + 48) / 49 + (b.e1 - b.e0)) : 0;
-            const int64_t t_cap32 = (n >= 17) ? std::min<int64_t>(b.e1 - b.e0, (n + 16) / 17) : 0;
-            const int64_t t_cap16 = (n >= 1) ? std::min<int64_t>(b.e1 - b.e0, n) : 0;
+            const int max_bm = pick_max_bm(n, n_expert);
+            const int64_t t_cap64 = (max_bm >= 64 && n >= 49) ? ((n + 48) / 49 + (b.e1 - b.e0)) : 0;
+            const int64_t t_cap32 = (max_bm >= 32 && n >= 17) ? ((max_bm == 32) ? ((n + 31) / 32 + (b.e1 - b.e0)) : std::min<int64_t>(b.e1 - b.e0, (n + 16) / 17)) : 0;
+            const int64_t t_cap16 = (n >= 1) ? ((max_bm == 16) ? ((n + 15) / 16 + (b.e1 - b.e0)) : std::min<int64_t>(b.e1 - b.e0, n)) : 0;
 
             Tables tb64 = tb; tb64.ts = tb.ts64; tb64.tiles = tb.tiles64;
             Tables tb32 = tb; tb32.ts = tb.ts32; tb32.tiles = tb.tiles32;

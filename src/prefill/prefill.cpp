@@ -911,6 +911,10 @@ struct Prefill::Impl {
           *shared = nullptr, *sg = nullptr;
     int32_t *ids = nullptr, *slot_dev = nullptr, *src_dev = nullptr;
     uint16_t *Xs = nullptr, *Hh = nullptr, *sh_h = nullptr;
+    const uint8_t** res_blobs_dev = nullptr;
+    std::vector<const uint8_t*> res_blobs_host;
+    std::vector<int32_t> res_blobs_snap;
+    std::vector<uint8_t> res_layer_full;
     // step 2b (MMQ): the activations quantized per layer, H in FP32 and its group's quantized rows, the identity
     // row map, the group bounds, the group buffers of gathered experts
     void *Xq = nullptr, *Hq = nullptr;
@@ -2897,6 +2901,38 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 std::fprintf(stderr, "strata pf-step: chunk from token %lld, layer %lld: %s took %.0f ms (%s / %s)\n",
                              (long long) p0, (long long) layer, what, ms, cudaGetErrorString(a), cudaGetErrorString(b));
         };
+        if (m.cache != nullptr && m.host_res != nullptr && m.g != nullptr) {
+            const size_t total_experts = (size_t) m.g->n_layers * (size_t) m.g->n_expert;
+            const size_t bytes = total_experts * sizeof(const uint8_t*);
+            if (m.res_blobs_snap.size() != total_experts ||
+                std::memcmp(m.res_blobs_snap.data(), m.host_res, total_experts * sizeof(int32_t)) != 0) {
+                m.res_blobs_snap.assign(m.host_res, m.host_res + total_experts);
+                m.res_blobs_host.resize(total_experts);
+                m.res_layer_full.assign((size_t) m.g->n_layers, 1);
+                for (size_t l_idx = 0; l_idx < (size_t) m.g->n_layers; ++l_idx) {
+                    for (size_t e_idx = 0; e_idx < (size_t) m.g->n_expert; ++e_idx) {
+                        const size_t idx = l_idx * (size_t) m.g->n_expert + e_idx;
+                        const int32_t r = m.host_res[idx];
+                        if (r >= 0) {
+                            m.res_blobs_host[idx] = m.cache->device_slot(r);
+                        } else {
+                            m.res_blobs_host[idx] = nullptr;
+                            m.res_layer_full[l_idx] = 0;
+                        }
+                    }
+                }
+                if (m.res_blobs_dev == nullptr) {
+                    void* dev_ptr = nullptr;
+                    if (cudaMalloc(&dev_ptr, bytes) == cudaSuccess) {
+                        m.res_blobs_dev = (const uint8_t**) dev_ptr;
+                        m.owned.push_back(dev_ptr);
+                    }
+                }
+                if (m.res_blobs_dev != nullptr) {
+                    cudaMemcpyAsync(m.res_blobs_dev, m.res_blobs_host.data(), bytes, cudaMemcpyHostToDevice, m.cs);
+                }
+            }
+        }
         for (int64_t l = LB; l < LE; ++l) {
             core::progress_beat();   // the serve watchdog: a prompt chunk of 8192 tokens is still moving
             if (l > LB) pf_step("reading the prompt (batched, step sync): the experts and the rest of layer", l - 1);
@@ -3504,29 +3540,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         const size_t per = (size_t) std::max(1, m.ring / 3);
                         size_t k = seq_start[(size_t) l];
                         const size_t kend = seq_start[(size_t) l + 1];
-                        for (int32_t e = 0; e < m.g->n_expert;) {
+                        if (k == kend && m.res_blobs_dev != nullptr &&
+                            (size_t) l < m.res_layer_full.size() && m.res_layer_full[(size_t) l]) {
                             fused::Batch b;
-                            b.e0 = e;
-                            const size_t k0 = k;
-                            for (; e < m.g->n_expert && e - b.e0 < fused::kMaxBatch; ++e) {
-                                if (k < kend && seq[k].e == e) {
-                                    if (k - k0 == per) break;
-                                    b.blob[e - b.e0] = m.stage_dev[k % (size_t) m.ring];
-                                    ++k;
-                                } else {                  // not streamed: resident (the walk streams all others)
-                                    b.blob[e - b.e0] = m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e]);
-                                    // counted whether routed or not (the routing stays on the GPU): at a streamed
-                                    // chunk's size (>= 1024 tokens x 10 of 512) nearly every expert is routed
-                                    ++stats_.experts_resident;
-                                }
-                            }
-                            b.e1 = e;
-                            if (k > k0) {
-                                // one copy stream, in order: the batch's last blob covers the others
-                                pt.mark(kPfWaitCopy, cs);
-                                wait_issued(k - 1);
-                                cudaStreamWaitEvent(m.cs, m.copied[(k - 1) % (size_t) m.ring], 0);
-                            }
+                            b.e0 = 0;
+                            b.e1 = (int) m.g->n_expert;
+                            b.blob_dev = m.res_blobs_dev + (size_t) l * (size_t) m.g->n_expert;
+                            stats_.experts_resident += m.g->n_expert;
                             pt.mark(kPfGemmGU, cs);
                             if (fused_nat) {
                                 const auto& f = lay.fmt[(size_t) l];
@@ -3536,13 +3556,47 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             } else {
                                 fused::experts(b, (int) m.g->n_expert, T * K, m.GU, m.Xq, m.src_dev, m.H, m.Dm, m.cs);
                             }
-                            for (size_t kk = k0; kk < k; ++kk) {
-                                cudaEventRecord(m.used[kk % (size_t) m.ring], m.cs);
-                                m.used_of[kk % (size_t) m.ring] = (int) (kk % (size_t) m.ring);
-                            }
-                            if (k > k0) {
-                                consumed = k;
-                                give_back(consumed);
+                        } else {
+                            for (int32_t e = 0; e < m.g->n_expert;) {
+                                fused::Batch b;
+                                b.e0 = e;
+                                const size_t k0 = k;
+                                for (; e < m.g->n_expert && e - b.e0 < fused::kMaxBatch; ++e) {
+                                    if (k < kend && seq[k].e == e) {
+                                        if (k - k0 == per) break;
+                                        b.blob[e - b.e0] = m.stage_dev[k % (size_t) m.ring];
+                                        ++k;
+                                    } else {                  // not streamed: resident (the walk streams all others)
+                                        b.blob[e - b.e0] = m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e]);
+                                        // counted whether routed or not (the routing stays on the GPU): at a streamed
+                                        // chunk's size (>= 1024 tokens x 10 of 512) nearly every expert is routed
+                                        ++stats_.experts_resident;
+                                    }
+                                }
+                                b.e1 = e;
+                                if (k > k0) {
+                                    // one copy stream, in order: the batch's last blob covers the others
+                                    pt.mark(kPfWaitCopy, cs);
+                                    wait_issued(k - 1);
+                                    cudaStreamWaitEvent(m.cs, m.copied[(k - 1) % (size_t) m.ring], 0);
+                                }
+                                pt.mark(kPfGemmGU, cs);
+                                if (fused_nat) {
+                                    const auto& f = lay.fmt[(size_t) l];
+                                    const fused::NativeGeom ng{f.gu_type, f.d_type, f.gu_row, f.d_row, f.up_off, f.down_off};
+                                    fused::experts_native(b, ng, (int) m.g->n_expert, T * K, m.GU, m.Xq, m.src_dev, m.H,
+                                                          m.Dm, m.cs);
+                                } else {
+                                    fused::experts(b, (int) m.g->n_expert, T * K, m.GU, m.Xq, m.src_dev, m.H, m.Dm, m.cs);
+                                }
+                                for (size_t kk = k0; kk < k; ++kk) {
+                                    cudaEventRecord(m.used[kk % (size_t) m.ring], m.cs);
+                                    m.used_of[kk % (size_t) m.ring] = (int) (kk % (size_t) m.ring);
+                                }
+                                if (k > k0) {
+                                    consumed = k;
+                                    give_back(consumed);
+                                }
                             }
                         }
                     } else {

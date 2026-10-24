@@ -55,7 +55,11 @@ void group(const int32_t* ids, int64_t n, int k, int n_expert, void* scratch, in
 /// device (16-byte aligned), read only for an expert with rows.
 struct Batch {
     int e0 = 0, e1 = 0;
+    const uint8_t* const* blob_dev = nullptr; // optional device array [e1 - e0]; allows e1 - e0 > kMaxBatch (e.g. 512)
     const uint8_t* blob[kMaxBatch] = {};
+    __host__ __device__ inline const uint8_t* at(int idx) const {
+        return blob_dev ? blob_dev[idx] : blob[idx];
+    }
 };
 /// The batch's products: gate/up from `xa` (quantize_act of the layer's input, [tokens][2560]) through the rows
 /// `src` of `group`, SwiGLU, H as int8 into `ha` (act_bytes(n, 640)), down into `dm` [n][2560] FP32 at the rows of

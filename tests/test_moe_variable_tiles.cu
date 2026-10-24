@@ -40,6 +40,30 @@ static void set_var_bm_env(int val) {
 #endif
 }
 
+static void set_max_bm_env(int val) {
+#ifdef _WIN32
+    if (val == 16) _putenv("STRATA_MOE_MAX_BM=16");
+    else if (val == 32) _putenv("STRATA_MOE_MAX_BM=32");
+    else if (val == 64) _putenv("STRATA_MOE_MAX_BM=64");
+    else _putenv("STRATA_MOE_MAX_BM=");
+#else
+    if (val == 16) setenv("STRATA_MOE_MAX_BM", "16", 1);
+    else if (val == 32) setenv("STRATA_MOE_MAX_BM", "32", 1);
+    else if (val == 64) setenv("STRATA_MOE_MAX_BM", "64", 1);
+    else unsetenv("STRATA_MOE_MAX_BM");
+#endif
+}
+
+static void set_f16_env(int val) {
+#ifdef _WIN32
+    if (val == 0) _putenv("STRATA_PF_F16=0");
+    else _putenv("STRATA_PF_F16=1");
+#else
+    if (val == 0) setenv("STRATA_PF_F16", "0", 1);
+    else setenv("STRATA_PF_F16", "1", 1);
+#endif
+}
+
 constexpr int N = 2560;
 constexpr int FF = 640;
 constexpr int K = 10;
@@ -106,6 +130,21 @@ struct ExpertPool {
         g.up_off = up_off;
         g.down_off = down_off;
         return g;
+    }
+};
+
+struct BlobTable {
+    const uint8_t** d_ptr = nullptr;
+    BlobTable(const ExpertPool& pool, int E) {
+        std::vector<const uint8_t*> h_ptrs(E);
+        for (int e = 0; e < E; ++e) {
+            h_ptrs[e] = pool.d_blobs[e & 15];
+        }
+        CUDA_CHECK(cudaMalloc(&d_ptr, (size_t) E * sizeof(const uint8_t*)));
+        CUDA_CHECK(cudaMemcpy(d_ptr, h_ptrs.data(), (size_t) E * sizeof(const uint8_t*), cudaMemcpyHostToDevice));
+    }
+    ~BlobTable() {
+        if (d_ptr) cudaFree(d_ptr);
     }
 };
 
@@ -280,8 +319,177 @@ static ParityResult run_single_parity(const ExpertPool& pool, int E, int T, int 
     return res;
 }
 
-static void run_speedup_benchmark(const ExpertPool& pool, int E, int T,
+static ParityResult run_1batch_vs_4batch_parity(const ExpertPool& pool, const BlobTable& blob_tbl,
+                                               int E, int T, int mode,
+                                               const float* d_x, const int32_t* d_ids,
+                                               void* d_scratch, int32_t* d_slot, int32_t* d_src,
+                                               uint8_t* d_xa,
+                                               uint8_t* d_ha_alloc, size_t ha_bytes,
+                                               uint8_t* d_dm_alloc, size_t dm_bytes,
+                                               cudaStream_t stream) {
+    const int64_t n = (int64_t) T * K;
+    const fused::NativeGeom ng = pool.geom();
+    uint8_t* d_ha = d_ha_alloc + CANARY_BYTES;
+    float* d_dm = reinterpret_cast<float*>(d_dm_alloc + CANARY_BYTES);
+
+    fused::quantize_act_native(d_x, T, N, d_xa, stream);
+    fused::group(d_ids, n, K, E, d_scratch, d_slot, d_src, stream);
+
+    set_var_bm_env(1);
+    set_max_bm_env(0);
+    set_f16_env(0);
+
+    // 1. Run 4-batch
+    init_canary_buffer(d_ha_alloc, ha_bytes);
+    init_canary_buffer(d_dm_alloc, dm_bytes);
+    CUDA_CHECK(cudaMemsetAsync(d_dm, 0, dm_bytes, stream));
+
+    for (int e0 = 0; e0 < E; e0 += fused::kMaxBatch) {
+        fused::Batch b;
+        b.e0 = e0;
+        b.e1 = std::min(E, e0 + fused::kMaxBatch);
+        for (int e = b.e0; e < b.e1; ++e) b.blob[e - b.e0] = pool.d_blobs[e & 15];
+        fused::experts_native(b, ng, E, n, d_scratch, d_xa, d_src, d_ha, d_dm, stream);
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    ParityResult res;
+    if (!verify_canaries(d_ha_alloc, ha_bytes, "ha (4-batch)") ||
+        !verify_canaries(d_dm_alloc, dm_bytes, "dm (4-batch)")) {
+        res.canaries_ok = false;
+        return res;
+    }
+
+    const size_t total_floats = (size_t) n * N;
+    std::vector<float> h_4batch(total_floats);
+    CUDA_CHECK(cudaMemcpy(h_4batch.data(), d_dm, dm_bytes, cudaMemcpyDeviceToHost));
+
+    // 2. Run 1-batch blob_dev
+    init_canary_buffer(d_ha_alloc, ha_bytes);
+    init_canary_buffer(d_dm_alloc, dm_bytes);
+    CUDA_CHECK(cudaMemsetAsync(d_dm, 0, dm_bytes, stream));
+
+    fused::Batch b1;
+    b1.e0 = 0;
+    b1.e1 = E;
+    b1.blob_dev = blob_tbl.d_ptr;
+    fused::experts_native(b1, ng, E, n, d_scratch, d_xa, d_src, d_ha, d_dm, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    if (!verify_canaries(d_ha_alloc, ha_bytes, "ha (1-batch)") ||
+        !verify_canaries(d_dm_alloc, dm_bytes, "dm (1-batch)")) {
+        res.canaries_ok = false;
+        return res;
+    }
+
+    std::vector<float> h_1batch(total_floats);
+    CUDA_CHECK(cudaMemcpy(h_1batch.data(), d_dm, dm_bytes, cudaMemcpyDeviceToHost));
+
+    double dot = 0.0, norm_a = 0.0, norm_b = 0.0;
+    for (size_t i = 0; i < total_floats; ++i) {
+        const double va = h_4batch[i];
+        const double vb = h_1batch[i];
+        dot += va * vb;
+        norm_a += va * va;
+        norm_b += vb * vb;
+        const float diff = std::fabs(h_4batch[i] - h_1batch[i]);
+        if (diff > res.max_abs_diff) res.max_abs_diff = diff;
+        const float denom = std::max(std::fabs(h_4batch[i]), std::fabs(h_1batch[i]));
+        if (denom > 1e-6f) {
+            res.max_rel_diff = std::max(res.max_rel_diff, diff / denom);
+        }
+    }
+    if (norm_a > 0.0 && norm_b > 0.0) {
+        res.cos_sim = dot / (std::sqrt(norm_a) * std::sqrt(norm_b));
+    }
+    return res;
+}
+
+static bool run_extreme_skew_test(const ExpertPool& pool, const BlobTable& blob_tbl,
+                                  int E, int T, int max_bm_target,
                                   cudaStream_t stream) {
+    const int64_t n = (int64_t) T * K;
+    const fused::NativeGeom ng = pool.geom();
+
+    std::mt19937 rng(999);
+    std::vector<float> h_x((size_t) T * N);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    for (float& v : h_x) v = nd(rng);
+
+    // 100% of tokens routed to expert 0
+    std::vector<int32_t> ids(n, 0);
+
+    float* d_x = nullptr;
+    int32_t* d_ids = nullptr;
+    int32_t* d_slot = nullptr;
+    int32_t* d_src = nullptr;
+    void* d_scratch = nullptr;
+    uint8_t* d_xa = nullptr;
+    uint8_t* d_ha_alloc = nullptr;
+    uint8_t* d_dm_alloc = nullptr;
+
+    const size_t xa_bytes = fused::act_bytes(T, N);
+    const size_t ha_bytes = fused::act_bytes(n, FF);
+    const size_t dm_bytes = (size_t) n * N * sizeof(float);
+    const size_t scratch_sz = fused::group_bytes(n, E);
+
+    CUDA_CHECK(cudaMalloc(&d_x, (size_t) T * N * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_ids, (size_t) n * sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(&d_slot, (size_t) n * sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(&d_src, (size_t) n * sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(&d_scratch, scratch_sz));
+    CUDA_CHECK(cudaMalloc(&d_xa, xa_bytes));
+    CUDA_CHECK(cudaMalloc(&d_ha_alloc, ha_bytes + 2 * CANARY_BYTES));
+    CUDA_CHECK(cudaMalloc(&d_dm_alloc, dm_bytes + 2 * CANARY_BYTES));
+
+    CUDA_CHECK(cudaMemcpy(d_x, h_x.data(), (size_t) T * N * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_ids, ids.data(), (size_t) n * sizeof(int32_t), cudaMemcpyHostToDevice));
+
+    uint8_t* d_ha = d_ha_alloc + CANARY_BYTES;
+    float* d_dm = reinterpret_cast<float*>(d_dm_alloc + CANARY_BYTES);
+
+    fused::quantize_act_native(d_x, T, N, d_xa, stream);
+    fused::group(d_ids, n, K, E, d_scratch, d_slot, d_src, stream);
+
+    set_var_bm_env(1);
+    set_max_bm_env(max_bm_target);
+    set_f16_env(0);
+
+    init_canary_buffer(d_ha_alloc, ha_bytes);
+    init_canary_buffer(d_dm_alloc, dm_bytes);
+    CUDA_CHECK(cudaMemsetAsync(d_dm, 0, dm_bytes, stream));
+
+    fused::Batch b;
+    b.e0 = 0;
+    b.e1 = E;
+    b.blob_dev = blob_tbl.d_ptr;
+    fused::experts_native(b, ng, E, n, d_scratch, d_xa, d_src, d_ha, d_dm, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    bool ok = verify_canaries(d_ha_alloc, ha_bytes, "ha (extreme skew)") &&
+              verify_canaries(d_dm_alloc, dm_bytes, "dm (extreme skew)");
+
+    cudaFree(d_x);
+    cudaFree(d_ids);
+    cudaFree(d_slot);
+    cudaFree(d_src);
+    cudaFree(d_scratch);
+    cudaFree(d_xa);
+    cudaFree(d_ha_alloc);
+    cudaFree(d_dm_alloc);
+    return ok;
+}
+
+struct LatencyRow {
+    int T = 0;
+    float ms_legacy_48 = 0.0f;
+    float ms_vbm4_48 = 0.0f;
+    float ms_b5b_48 = 0.0f;
+    float ms_f16_48 = 0.0f;
+};
+
+static LatencyRow run_single_benchmark_t(const ExpertPool& pool, const BlobTable& blob_tbl,
+                                         int E, int T, cudaStream_t stream) {
     const int64_t n = (int64_t) T * K;
     const fused::NativeGeom ng = pool.geom();
 
@@ -327,9 +535,13 @@ static void run_speedup_benchmark(const ExpertPool& pool, int E, int T,
 
     const int warmup = 5;
     const int iters = 20;
+    LatencyRow row;
+    row.T = T;
 
-    // Benchmark Baseline (STRATA_MOE_VAR_BM=0)
+    // 1. 4-Batch Legacy BM=64 (STRATA_MOE_VAR_BM=0)
     set_var_bm_env(0);
+    set_max_bm_env(0);
+    set_f16_env(0);
     for (int i = 0; i < warmup; ++i) {
         for (int e0 = 0; e0 < E; e0 += fused::kMaxBatch) {
             fused::Batch b;
@@ -339,7 +551,6 @@ static void run_speedup_benchmark(const ExpertPool& pool, int E, int T,
         }
     }
     CUDA_CHECK(cudaStreamSynchronize(stream));
-
     CUDA_CHECK(cudaEventRecord(ev_start, stream));
     for (int i = 0; i < iters; ++i) {
         for (int e0 = 0; e0 < E; e0 += fused::kMaxBatch) {
@@ -351,13 +562,14 @@ static void run_speedup_benchmark(const ExpertPool& pool, int E, int T,
     }
     CUDA_CHECK(cudaEventRecord(ev_stop, stream));
     CUDA_CHECK(cudaEventSynchronize(ev_stop));
+    float ms_total = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&ms_total, ev_start, ev_stop));
+    row.ms_legacy_48 = (ms_total / (float) iters) * 48.0f;
 
-    float ms_base_total = 0.0f;
-    CUDA_CHECK(cudaEventElapsedTime(&ms_base_total, ev_start, ev_stop));
-    const float ms_base = ms_base_total / (float) iters;
-
-    // Benchmark Hybrid (STRATA_MOE_VAR_BM=1)
+    // 2. 4-Batch Var-BM B64/B32/B16 (Stage 5.4)
     set_var_bm_env(1);
+    set_max_bm_env(64);
+    set_f16_env(0);
     for (int i = 0; i < warmup; ++i) {
         for (int e0 = 0; e0 < E; e0 += fused::kMaxBatch) {
             fused::Batch b;
@@ -367,7 +579,6 @@ static void run_speedup_benchmark(const ExpertPool& pool, int E, int T,
         }
     }
     CUDA_CHECK(cudaStreamSynchronize(stream));
-
     CUDA_CHECK(cudaEventRecord(ev_start, stream));
     for (int i = 0; i < iters; ++i) {
         for (int e0 = 0; e0 < E; e0 += fused::kMaxBatch) {
@@ -379,14 +590,45 @@ static void run_speedup_benchmark(const ExpertPool& pool, int E, int T,
     }
     CUDA_CHECK(cudaEventRecord(ev_stop, stream));
     CUDA_CHECK(cudaEventSynchronize(ev_stop));
+    ms_total = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&ms_total, ev_start, ev_stop));
+    row.ms_vbm4_48 = (ms_total / (float) iters) * 48.0f;
 
-    float ms_var_total = 0.0f;
-    CUDA_CHECK(cudaEventElapsedTime(&ms_var_total, ev_start, ev_stop));
-    const float ms_var = ms_var_total / (float) iters;
+    // 3. 1-Batch All-512 Adaptive max_bm INT8 (Stage 5B.1)
+    set_var_bm_env(1);
+    set_max_bm_env(0);
+    set_f16_env(0);
+    fused::Batch b1;
+    b1.e0 = 0; b1.e1 = E; b1.blob_dev = blob_tbl.d_ptr;
+    for (int i = 0; i < warmup; ++i) {
+        fused::experts_native(b1, ng, E, n, d_scratch, d_xa, d_src, d_ha, d_dm, stream);
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaEventRecord(ev_start, stream));
+    for (int i = 0; i < iters; ++i) {
+        fused::experts_native(b1, ng, E, n, d_scratch, d_xa, d_src, d_ha, d_dm, stream);
+    }
+    CUDA_CHECK(cudaEventRecord(ev_stop, stream));
+    CUDA_CHECK(cudaEventSynchronize(ev_stop));
+    ms_total = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&ms_total, ev_start, ev_stop));
+    row.ms_b5b_48 = (ms_total / (float) iters) * 48.0f;
 
-    const float speedup_pct = (ms_base - ms_var) / ms_base * 100.0f;
-    std::printf("  [Perf] T = %4d | Baseline (BM=64): %7.3f ms | Hybrid (BM=16/32/64): %7.3f ms | Speedup: %+6.2f%%\n",
-                T, ms_base, ms_var, speedup_pct);
+    // 4. 1-Batch All-512 STRATA_PF_F16=1 (FP16 WMMA)
+    set_f16_env(1);
+    for (int i = 0; i < warmup; ++i) {
+        fused::experts_native(b1, ng, E, n, d_scratch, d_xa, d_src, d_ha, d_dm, stream);
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaEventRecord(ev_start, stream));
+    for (int i = 0; i < iters; ++i) {
+        fused::experts_native(b1, ng, E, n, d_scratch, d_xa, d_src, d_ha, d_dm, stream);
+    }
+    CUDA_CHECK(cudaEventRecord(ev_stop, stream));
+    CUDA_CHECK(cudaEventSynchronize(ev_stop));
+    ms_total = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&ms_total, ev_start, ev_stop));
+    row.ms_f16_48 = (ms_total / (float) iters) * 48.0f;
 
     CUDA_CHECK(cudaEventDestroy(ev_start));
     CUDA_CHECK(cudaEventDestroy(ev_stop));
@@ -398,11 +640,33 @@ static void run_speedup_benchmark(const ExpertPool& pool, int E, int T,
     cudaFree(d_xa);
     cudaFree(d_ha);
     cudaFree(d_dm);
+    return row;
+}
+
+static void run_48layer_microbenchmark(const ExpertPool& pool, const BlobTable& blob_tbl,
+                                       const char* quant_name, int E, cudaStream_t stream) {
+    std::printf("\n========================================================================================================================\n");
+    std::printf("  MoE 48-Layer Wall Time Micro-Benchmark: Radeon 8060S (gfx1151) | E=%d, K=10, 48 Layers\n", E);
+    std::printf("  Quant Configuration: %s\n", quant_name);
+    std::printf("========================================================================================================================\n");
+    std::printf("  Tokens | 4-Batch Legacy  | 4-Batch Var-BM   | 1-Batch All-512  | 1-Batch All-512  | Speedup vs   | Speedup vs\n");
+    std::printf("     (T) | (BM=64, 4-bat)  | (B64/32/16, 4-b) | INT8 (Stage5B.1) | FP16 WMMA (1-b)  | 4-b Legacy   | 4-b Var-BM\n");
+    std::printf("---------+-----------------+------------------+------------------+------------------+--------------+--------------\n");
+
+    const std::vector<int> test_T = {647, 1621, 5164, 10446};
+    for (int T : test_T) {
+        LatencyRow r = run_single_benchmark_t(pool, blob_tbl, E, T, stream);
+        const float sp_legacy = (r.ms_legacy_48 - r.ms_b5b_48) / r.ms_legacy_48 * 100.0f;
+        const float sp_vbm = (r.ms_vbm4_48 - r.ms_b5b_48) / r.ms_vbm4_48 * 100.0f;
+        std::printf("  %6d | %10.2f ms   | %11.2f ms  | %11.2f ms  | %11.2f ms  | %+10.2f%%  | %+10.2f%%\n",
+                    T, r.ms_legacy_48, r.ms_vbm4_48, r.ms_b5b_48, r.ms_f16_48, sp_legacy, sp_vbm);
+    }
+    std::printf("========================================================================================================================\n");
 }
 
 int main() {
     std::printf("================================================================================\n");
-    std::printf("  test_moe_variable_tiles - Pass 5.4 3-Bucket WMMA Parity & Speedup Gate\n");
+    std::printf("  test_moe_variable_tiles - Pass 5B.1 Single-Batch E=512 WMMA Parity & Speedup\n");
     std::printf("================================================================================\n");
 
     std::mt19937 rng(1337);
@@ -419,6 +683,9 @@ int main() {
     ExpertPool pool_iq4xs_iq4nl(GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL, rng);
     ExpertPool pool_iq4xs_q80(GGML_TYPE_IQ4_XS, GGML_TYPE_Q8_0, rng);
     ExpertPool pool_iq3s_iq4nl(GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, rng);
+
+    BlobTable blob_tbl_iq4xs_iq4nl(pool_iq4xs_iq4nl, 512);
+    BlobTable blob_tbl_iq3s_iq4nl(pool_iq3s_iq4nl, 512);
 
     // Test token counts
     const std::vector<int> boundary_T = {1, 6, 13, 16, 17, 31, 32, 33, 48, 49, 63, 64, 65, 662, 1637};
@@ -523,6 +790,32 @@ int main() {
         }
     }
 
+    std::printf("\n--- Section 3: Exact 1-Batch (blob_dev) vs 4-Batch (blob[128]) Parity ---\n");
+    for (int T : {1, 17, 65, 662, 1637}) {
+        const int64_t n = (int64_t) T * K;
+        const std::vector<int32_t> ids = generate_routing(1 /* Zipfian */, n, 512);
+        CUDA_CHECK(cudaMemcpy(d_ids, ids.data(), (size_t) n * sizeof(int32_t), cudaMemcpyHostToDevice));
+
+        const size_t cur_ha_bytes = fused::act_bytes(n, FF);
+        const size_t cur_dm_bytes = (size_t) n * N * sizeof(float);
+
+        ParityResult res = run_1batch_vs_4batch_parity(pool_iq4xs_iq4nl, blob_tbl_iq4xs_iq4nl,
+                                                       512, T, 1,
+                                                       d_x, d_ids, d_scratch, d_slot, d_src, d_xa,
+                                                       d_ha_alloc, cur_ha_bytes,
+                                                       d_dm_alloc, cur_dm_bytes,
+                                                       stream);
+        total_tests++;
+        const bool pass = res.canaries_ok && (res.max_abs_diff == 0.0f);
+        if (!pass) {
+            all_passed = false;
+            std::printf("  [FAIL] 1-batch vs 4-batch T=%4d: max_abs=%.6f cos=%.8f canary=%s\n",
+                        T, res.max_abs_diff, res.cos_sim, res.canaries_ok ? "OK" : "CORRUPT");
+        } else {
+            std::printf("  [PASS] 1-batch vs 4-batch T=%4d: max_abs=0.000000 (EXACT BIT IDENTICAL), cos=1.00000000, canary=OK\n", T);
+        }
+    }
+
     // Clean up parity allocations
     cudaFree(d_x);
     cudaFree(d_ids);
@@ -533,16 +826,27 @@ int main() {
     cudaFree(d_ha_alloc);
     cudaFree(d_dm_alloc);
 
-    std::printf("\n--- Section 3: GPU Latency Speedup Benchmark (E=512, top_k=10, Qwen 177B) ---\n");
-    run_speedup_benchmark(pool_iq4xs_iq4nl, 512, 662, stream);
-    run_speedup_benchmark(pool_iq4xs_iq4nl, 512, 1637, stream);
-    run_speedup_benchmark(pool_iq4xs_iq4nl, 512, 5184, stream);
+    std::printf("\n--- Section 4: Extreme Expert Skew Safety (100%% of 6,470 tokens on Expert 0) ---\n");
+    for (int bm : {16, 32}) {
+        bool ok = run_extreme_skew_test(pool_iq4xs_iq4nl, blob_tbl_iq4xs_iq4nl, 512, 647, bm, stream);
+        total_tests++;
+        if (!ok) {
+            all_passed = false;
+            std::printf("  [FAIL] Extreme Skew T=647 (6,470 rows on exp 0) max_bm=%d: CANARY CORRUPTED!\n", bm);
+        } else {
+            std::printf("  [PASS] Extreme Skew T=647 (6,470 rows on exp 0) max_bm=%d: 0 OOB writes, canaries intact!\n", bm);
+        }
+    }
+
+    std::printf("\n--- Section 5: Realistic 48-Layer Wall Time Micro-Benchmark (Radeon 8060S gfx1151) ---\n");
+    run_48layer_microbenchmark(pool_iq4xs_iq4nl, blob_tbl_iq4xs_iq4nl, "IQ4_XS (Gate+Up) / IQ4_NL (Down)", 512, stream);
+    run_48layer_microbenchmark(pool_iq3s_iq4nl, blob_tbl_iq3s_iq4nl, "IQ3_S (Gate+Up) / IQ4_NL (Down)", 512, stream);
 
     CUDA_CHECK(cudaStreamDestroy(stream));
 
     std::printf("\n================================================================================\n");
     if (all_passed) {
-        std::printf("  ALL %d PARITY CHECKS PASSED (cos >= 0.999999, 0 canary overwrites)!\n", total_tests);
+        std::printf("  ALL %d PARITY CHECKS PASSED (cos >= 0.999999, exact bit parity, 0 canary overwrites)!\n", total_tests);
         std::printf("================================================================================\n");
         return 0;
     } else {

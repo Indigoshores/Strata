@@ -40,12 +40,24 @@ __host__ __device__ inline size_t cap_b64(int64_t n, int n_expert) {
     return (size_t) ((n + BM_B64 - 1) / BM_B64 + n_expert);
 }
 
-__host__ __device__ inline size_t cap_b32(int64_t /*n*/, int n_expert) {
-    return (size_t) n_expert;
+__host__ __device__ inline size_t cap_b32(int64_t n, int n_expert) {
+    return (size_t) ((n + BM_B32 - 1) / BM_B32 + n_expert);
 }
 
-__host__ __device__ inline size_t cap_b16(int64_t /*n*/, int n_expert) {
-    return (size_t) n_expert;
+__host__ __device__ inline size_t cap_b16(int64_t n, int n_expert) {
+    return (size_t) ((n + BM_B16 - 1) / BM_B16 + n_expert);
+}
+
+inline int pick_max_bm(int64_t n, int n_expert) {
+    const char* v = std::getenv("STRATA_MOE_MAX_BM");
+    if (v != nullptr && v[0] != '\0') {
+        int val = std::atoi(v);
+        if (val == 16 || val == 32 || val == 64) return val;
+    }
+    const double avg = (double) n / std::max(n_expert, 1);
+    if (avg <= 16.0) return 16;
+    if (avg <= 40.0) return 32;
+    return 64;
 }
 
 __host__ __device__ inline size_t bucket_scratch_bytes(int64_t n, int n_expert) {
@@ -127,7 +139,7 @@ __global__ inline void count_kernel(const int32_t* __restrict__ ids, int64_t n, 
         if (hist[e]) atomicAdd(&cnt[e], hist[e]);
 }
 
-__global__ inline void scan_buckets_kernel(Tables tb, int E) {
+__global__ inline void scan_buckets_kernel(Tables tb, int E, int max_bm = 64) {
     __shared__ int sh[32];
     const int e = threadIdx.x;
     const int c = (e < E) ? tb.cnt[e] : 0;
@@ -135,12 +147,25 @@ __global__ inline void scan_buckets_kernel(Tables tb, int E) {
     // Legacy tile count (BM = 64)
     const int nt_legacy = (c + BM_B64 - 1) / BM_B64;
 
-    // 3-Bucket tile counts
-    const int n_full = c / 64;
-    const int r = c - 64 * n_full;
-    const int c64 = n_full + (r >= 49 ? 1 : 0);
-    const int c32 = (r >= 17 && r <= 48) ? 1 : 0;
-    const int c16 = ((r >= 1 && r <= 16) || (r >= 33 && r <= 48)) ? 1 : 0;
+    // Adaptive bucket tile counts
+    int c64 = 0, c32 = 0, c16 = 0;
+    int n_full_64 = 0, r64 = 0;
+    int n_full_32 = 0, r32 = 0;
+
+    if (max_bm == 16) {
+        c16 = (c + 15) / 16;
+    } else if (max_bm == 32) {
+        n_full_32 = c / 32;
+        r32 = c - 32 * n_full_32;
+        c32 = n_full_32 + (r32 >= 17 ? 1 : 0);
+        c16 = (r32 >= 1 && r32 <= 16) ? 1 : 0;
+    } else {
+        n_full_64 = c / 64;
+        r64 = c - 64 * n_full_64;
+        c64 = n_full_64 + (r64 >= 49 ? 1 : 0);
+        c32 = (r64 >= 17 && r64 <= 48) ? 1 : 0;
+        c16 = ((r64 >= 1 && r64 <= 16) || (r64 >= 33 && r64 <= 48)) ? 1 : 0;
+    }
 
     int total_rows = 0;
     int total_tiles_legacy = 0;
@@ -167,24 +192,43 @@ __global__ inline void scan_buckets_kernel(Tables tb, int E) {
             tb.tiles[to + i] = make_int2(e, o + i * BM_B64);
         }
 
-        // Emit B64 tiles (BM = 64)
-        for (int i = 0; i < n_full; ++i) {
-            tb.tiles64[to64 + i] = make_int2(e, o + i * 64);
-        }
-        if (r >= 49) {
-            tb.tiles64[to64 + n_full] = make_int2(e, o + n_full * 64);
-        }
+        if (max_bm == 16) {
+            // Emit B16 tiles (BM = 16)
+            for (int i = 0; i < c16; ++i) {
+                tb.tiles16[to16 + i] = make_int2(e, o + i * 16);
+            }
+        } else if (max_bm == 32) {
+            // Emit B32 tiles (BM = 32)
+            for (int i = 0; i < n_full_32; ++i) {
+                tb.tiles32[to32 + i] = make_int2(e, o + i * 32);
+            }
+            if (r32 >= 17) {
+                tb.tiles32[to32 + n_full_32] = make_int2(e, o + n_full_32 * 32);
+            }
+            // Emit B16 tiles (BM = 16)
+            if (r32 >= 1 && r32 <= 16) {
+                tb.tiles16[to16] = make_int2(e, o + n_full_32 * 32);
+            }
+        } else {
+            // Emit B64 tiles (BM = 64)
+            for (int i = 0; i < n_full_64; ++i) {
+                tb.tiles64[to64 + i] = make_int2(e, o + i * 64);
+            }
+            if (r64 >= 49) {
+                tb.tiles64[to64 + n_full_64] = make_int2(e, o + n_full_64 * 64);
+            }
 
-        // Emit B32 tiles (BM = 32)
-        if (r >= 17 && r <= 48) {
-            tb.tiles32[to32] = make_int2(e, o + n_full * 64);
-        }
+            // Emit B32 tiles (BM = 32)
+            if (r64 >= 17 && r64 <= 48) {
+                tb.tiles32[to32] = make_int2(e, o + n_full_64 * 64);
+            }
 
-        // Emit B16 tiles (BM = 16)
-        if (r >= 1 && r <= 16) {
-            tb.tiles16[to16] = make_int2(e, o + n_full * 64);
-        } else if (r >= 33 && r <= 48) {
-            tb.tiles16[to16] = make_int2(e, o + n_full * 64 + 32);
+            // Emit B16 tiles (BM = 16)
+            if (r64 >= 1 && r64 <= 16) {
+                tb.tiles16[to16] = make_int2(e, o + n_full_64 * 64);
+            } else if (r64 >= 33 && r64 <= 48) {
+                tb.tiles16[to16] = make_int2(e, o + n_full_64 * 64 + 32);
+            }
         }
     }
 
@@ -210,7 +254,7 @@ __global__ inline void place_kernel(const int32_t* __restrict__ ids, int64_t n, 
 
 inline void group_bucketed(const int32_t* ids, int64_t n, int k, int n_expert,
                            void* scratch, int32_t* slot, int32_t* src,
-                           cudaStream_t stream = nullptr) {
+                           cudaStream_t stream = nullptr, int max_bm = 0) {
     if (n_expert < 1 || n_expert > 1024) {
         std::fprintf(stderr, "group_bucketed: %d experts (the grouping takes 1 to 1024)\n", n_expert);
         std::exit(1);
@@ -222,7 +266,8 @@ inline void group_bucketed(const int32_t* ids, int64_t n, int k, int n_expert,
         count_kernel<<<nb, 1024, (size_t) n_expert * sizeof(int32_t), stream>>>(ids, n, n_expert, tb.cnt);
     }
     const unsigned threads = (unsigned) std::max(32, ((n_expert + 31) / 32 * 32));
-    scan_buckets_kernel<<<1, threads, 0, stream>>>(tb, n_expert);
+    const int effective_max_bm = (max_bm == 16 || max_bm == 32 || max_bm == 64) ? max_bm : pick_max_bm(n, n_expert);
+    scan_buckets_kernel<<<1, threads, 0, stream>>>(tb, n_expert, effective_max_bm);
     if (n > 0 && (slot != nullptr || src != nullptr)) {
         unsigned nb = (unsigned) ((n + 255) / 256);
         place_kernel<<<nb, 256, 0, stream>>>(ids, n, k, n_expert, tb, slot, src);

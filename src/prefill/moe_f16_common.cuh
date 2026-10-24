@@ -52,11 +52,8 @@ constexpr int GU_ACT_LD = 2560 / 64 * AB, H_LD = 640 / 64 * AB;   // bytes per a
 
 /// STRATA_PF_F16=1 (on top of STRATA_PF_FUSED=1): the covered formats take the F16 kernels on gfx11.
 inline bool requested() {
-    static const bool on = [] {
-        const char* v = std::getenv("STRATA_PF_F16");
-        return v != nullptr && v[0] == '1';
-    }();
-    return on;
+    const char* v = std::getenv("STRATA_PF_F16");
+    return v != nullptr && v[0] == '1';
 }
 
 /// Two tiles a work item when an expert has a tile's rows or more on average.  gfx1151, Q4_K, top 10 over 512

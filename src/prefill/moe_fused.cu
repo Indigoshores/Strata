@@ -174,7 +174,7 @@ expert_kernel(const Batch b, const Tables tb, const uint8_t* __restrict__ act, c
     for (int w = blockIdx.x; w < nwork; w += gridDim.x) {
         const int2 tl = tb.tiles[t0 + w / NFB];
         const int fb = w % NFB, e = tl.x, row0 = tl.y, nrows = min(kTileRows, tb.off[e + 1] - row0);
-        const uint8_t* blob = b.blob[e - b.e0];
+        const uint8_t* blob = b.at(e - b.e0);
         const int rbase = fb * WROWS;
         __syncthreads();                                          // the previous item is done with the buffers
         if (tid < kTileRows) {
@@ -354,7 +354,7 @@ expert_w11_kernel(const Batch b, const Tables tb, const uint8_t* __restrict__ ac
     for (int w = blockIdx.x; w < nwork; w += gridDim.x) {
         const int2 tl = tb.tiles[t0 + w / NFB];
         const int fb = w % NFB, e = tl.x, row0 = tl.y, nrows = min(kTileRows, tb.off[e + 1] - row0);
-        const uint8_t* blob = b.blob[e - b.e0];
+        const uint8_t* blob = b.at(e - b.e0);
         const int rbase = fb * W_ROWS;
         __syncthreads();                                          // the previous item is done with srow / wsc / hs
         if (tid < kTileRows) {
