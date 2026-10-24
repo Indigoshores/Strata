@@ -131,19 +131,38 @@ template <typename T> inline hipError_t strata_host_alloc(T** p, size_t bytes, u
 #define cudaStreamCreate hipStreamCreate
 #define cudaStreamCreateWithFlags hipStreamCreateWithFlags
 #define cudaStreamDestroy hipStreamDestroy
-#define cudaStreamSynchronize hipStreamSynchronize
 #define cudaStreamQuery hipStreamQuery
+#define cudaStreamIsCapturing hipStreamIsCapturing
+#if defined(_WIN32)
+inline hipError_t strata_hip_compat_stream_sync(hipStream_t stream) {
+    hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
+    if (stream != nullptr && hipStreamIsCapturing(stream, &capture) == hipSuccess && capture == hipStreamCaptureStatusNone) {
+        (void)hipStreamQuery(stream);
+    }
+    return hipStreamSynchronize(stream);
+}
+#define cudaStreamSynchronize strata_hip_compat_stream_sync
+#else
+#define cudaStreamSynchronize hipStreamSynchronize
+#endif
 #define cudaStreamWaitEvent hipStreamWaitEvent
 #define cudaStreamBeginCapture hipStreamBeginCapture
 #define cudaStreamEndCapture hipStreamEndCapture
-#define cudaStreamIsCapturing hipStreamIsCapturing
 #define cudaLaunchHostFunc hipLaunchHostFunc
 #define cudaEventCreate hipEventCreate
 #define cudaEventCreateWithFlags hipEventCreateWithFlags
 #define cudaEventDestroy hipEventDestroy
 #define cudaEventRecord hipEventRecord
 #define cudaEventQuery hipEventQuery
+#if defined(_WIN32)
+inline hipError_t strata_hip_compat_event_sync(hipEvent_t ev) {
+    (void)hipEventQuery(ev);
+    return hipEventSynchronize(ev);
+}
+#define cudaEventSynchronize strata_hip_compat_event_sync
+#else
 #define cudaEventSynchronize hipEventSynchronize
+#endif
 #define cudaEventElapsedTime hipEventElapsedTime
 #define cudaGraphLaunch hipGraphLaunch
 #define cudaGraphUpload hipGraphUpload

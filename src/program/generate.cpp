@@ -73,6 +73,7 @@
 #include "strata/prefill/share_rules.hpp"
 #include "strata/platform/host_limits.hpp"
 #include "strata/program/split_ring.hpp"
+#include "strata/program/lookahead_policy.hpp"
 #include "strata/program/draft_kv_plan.hpp"
 #include "strata/program/message_boundary.hpp"
 #include "strata/spec/draft_policy.hpp"
@@ -6405,8 +6406,10 @@ int main(int argc, char** argv) {
                           [] { const char* v = std::getenv("STRATA_FS_AHEAD"); return v == nullptr || std::atoi(v) != 0; }();
     // STRATA_LOOKAHEAD_STATS=1 (measurement only): run the predictor on any tier and score it against the real routing
     const bool la_stats = srcp != nullptr && [] { const char* v = std::getenv("STRATA_LOOKAHEAD_STATS"); return v != nullptr && std::atoi(v) != 0; }();
-    if (srcp != nullptr && ((srcp == &src && src.warms()) || fs_ahead || la_stats) &&
-        [] { const char* v = std::getenv("STRATA_LOOKAHEAD"); return v == nullptr || std::atoi(v) != 0; }()) {
+    const char* lookahead_env = std::getenv("STRATA_LOOKAHEAD");
+    const bool lookahead_explicitly_enabled = lookahead_env != nullptr && std::atoi(lookahead_env) != 0;
+    const bool lookahead_enabled = lookahead_env == nullptr || lookahead_explicitly_enabled;
+    if (srcp != nullptr && ((srcp == &src && src.warms()) || fs_ahead || la_stats) && lookahead_enabled) {
         std::vector<std::vector<uint16_t>> routers((size_t) g.n_layers);
         bool ok = true;
         for (int64_t l = 0; l < g.n_layers && ok; ++l) {
@@ -9372,6 +9375,13 @@ int main(int argc, char** argv) {
         drive.d.pcie_num = std::max(0, std::min(256, (int) (o.pcie_frac * 256.0 + 0.5)));
         const bool all_experts_resident = !host_res.empty() &&
             std::all_of(host_res.begin(), host_res.end(), [](int32_t r) { return r >= 0; });
+        if (drive.d.lookahead != nullptr &&
+            !strata::program::keep_router_lookahead(all_experts_resident, lookahead_explicitly_enabled,
+                                                    la_stats, fs_swap != nullptr)) {
+            drive.d.lookahead = nullptr;
+            std::fprintf(stderr, "strata serve: routing-aware prefetch idle: every expert is in the GPU cache; "
+                                 "STRATA_LOOKAHEAD=1 forces it on\n");
+        }
         // STRATA_ROUTE_TAIL_SKIP: ON BY DEFAULT on CUDA builds (owner decision, 0.1.42) and on HIP gfx1200/gfx1201 (0.1.43): a missed expert that every token of
         // a verify window routes at rank 7 or lower is neither copied nor computed (answers differ slightly from 0.1.41,
         // KL ~0.003-0.006; docs/DETAILS.md).  =0 restores 0.1.41's bytes.  Nothing to do, so no default and no line, when every

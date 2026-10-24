@@ -21,6 +21,7 @@
 // (SwiGLU, H to int8 per 32 features; down into the per-slot rows) are moe_fused.cu's.
 #include "strata/prefill/moe_fused_iq.hpp"
 #include "strata/kernels/gfx_arch.hpp"
+#include "native_iq_wmma_config.hpp"
 #include "strata/core/emulate.hpp"
 
 #if defined(__HIPCC__)
@@ -768,7 +769,17 @@ native_kernel(const Batch b, const NativeGeom geo, const Tables tb, const uint8_
 #if defined(STRATA_W_LB)
 constexpr int NW_LB = STRATA_W_LB;
 #else
-constexpr int NW_LB = 8;
+#if defined(__clang_major__)
+constexpr int NW_CLANG_MAJOR = __clang_major__;
+#else
+constexpr int NW_CLANG_MAJOR = 0;
+#endif
+#if defined(__gfx1151__)
+constexpr bool NW_GFX1151 = true;
+#else
+constexpr bool NW_GFX1151 = false;
+#endif
+constexpr int NW_LB = config::native_iq_wmma_waves_per_eu(NW_CLANG_MAJOR, NW_GFX1151);
 #endif
 constexpr bool nw_capped(int wt) {
 #if defined(STRATA_W_LB) || !defined(__clang_major__) || __clang_major__ < 22

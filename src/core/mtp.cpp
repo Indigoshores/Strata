@@ -44,6 +44,10 @@
 #include <sstream>
 #include <vector>
 #if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 #include <intrin.h>
 #elif defined(__x86_64__)
 #include <immintrin.h>
@@ -843,7 +847,17 @@ void mtp_list_nodes(cudaGraph_t graph, const char* what) {
         if (ty == hipGraphNodeTypeKernel) {
             hipKernelNodeParams kp{};
             if (hipGraphKernelNodeGetParams(nd, &kp) == hipSuccess && kp.func != nullptr) {
+#if defined(_WIN32)
+                // Windows ROCm SDKs have declared this diagnostic helper before every matching runtime exported it.
+                // Resolve it lazily so ordinary MTP builds remain compatible with those runtimes; node listing simply
+                // falls back to the generic graph-node type when the optional name helper is absent.
+                using Fn_hipKernelNameRefByPtr = const char* (*)(const void*, hipStream_t);
+                static auto p_hipKernelNameRefByPtr = reinterpret_cast<Fn_hipKernelNameRefByPtr>(
+                    GetProcAddress(GetModuleHandleA("amdhip64_7.dll"), "hipKernelNameRefByPtr"));
+                const char* fn = p_hipKernelNameRefByPtr ? p_hipKernelNameRefByPtr(kp.func, nullptr) : nullptr;
+#else
                 const char* fn = hipKernelNameRefByPtr(kp.func, nullptr);
+#endif
                 if (fn != nullptr) name = fn;
             }
         }

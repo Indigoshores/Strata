@@ -1,4 +1,4 @@
-﻿# Strata Engine - top-level build (P1.S1).
+# Strata Engine - top-level build (P1.S1).
 #
 # Targets (phase-1 Ă‚Â§P1.S1): `strata_artifact` (no CUDA dependency), `tests`.  `strata_plan` and the C++
 # `strata-pack` are added when their sources exist - a target with no sources would make the build graph
@@ -283,6 +283,11 @@ if(STRATA_BUILD_TESTS)
   add_executable(tuning_header_arch_family_test tests/prefill/tuning_header_arch_family_test.cpp)
   target_include_directories(tuning_header_arch_family_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/prefill")
   add_test(NAME tuning_header_arch_family_test COMMAND tuning_header_arch_family_test)
+
+  # gfx1151 keeps the native-IQ WMMA occupancy cap on clang 22+; other architectures retain #1180's conservative rule.
+  add_executable(native_iq_wmma_config_test tests/prefill/native_iq_wmma_config_test.cpp)
+  target_include_directories(native_iq_wmma_config_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/prefill")
+  add_test(NAME native_iq_wmma_config_test COMMAND native_iq_wmma_config_test)
 
   # the auto layer split's minimum stage size (#1616): header-only rule, no GPU
   add_executable(split_rules_test tests/program/split_rules_test.cpp)
@@ -1328,6 +1333,10 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
   add_executable(split_ring_test src/program/split_ring_test.cpp)
   target_include_directories(split_ring_test PRIVATE include)
   add_test(NAME split_ring_test COMMAND split_ring_test)
+  # The file-tier router predictor stops after the final residency table proves that every expert is in VRAM.
+  add_executable(lookahead_policy_test src/program/lookahead_policy_test.cpp)
+  target_include_directories(lookahead_policy_test PRIVATE include)
+  add_test(NAME lookahead_policy_test COMMAND lookahead_policy_test)
   # the serve loop's conversation-cache retention policy (header-only, no library to link)
   add_executable(conv_cache_test src/program/conv_cache_test.cpp)
   target_include_directories(conv_cache_test PRIVATE include)

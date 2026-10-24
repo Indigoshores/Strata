@@ -41,7 +41,15 @@
 #define cudaEventElapsedTime hipEventElapsedTime
 #define cudaEventQuery hipEventQuery
 #define cudaEventRecord hipEventRecord
+#if defined(_WIN32)
+inline hipError_t strata_hip_event_synchronize(hipEvent_t ev) {
+    (void)hipEventQuery(ev);
+    return hipEventSynchronize(ev);
+}
+#define cudaEventSynchronize strata_hip_event_synchronize
+#else
 #define cudaEventSynchronize hipEventSynchronize
+#endif
 #define cudaEvent_t hipEvent_t
 #define cudaFree hipFree
 #if HIP_VERSION_MAJOR < 7
@@ -119,7 +127,18 @@ hipError_t mem_get_info(size_t* free_bytes, size_t* total_bytes);
 #define cudaStreamIsCapturing hipStreamIsCapturing
 #define cudaStreamNonBlocking hipStreamNonBlocking
 #define cudaStreamQuery hipStreamQuery
+#if defined(_WIN32)
+inline hipError_t strata_hip_stream_synchronize(hipStream_t stream) {
+    hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
+    if (stream != nullptr && hipStreamIsCapturing(stream, &capture) == hipSuccess && capture == hipStreamCaptureStatusNone) {
+        (void)hipStreamQuery(stream);
+    }
+    return hipStreamSynchronize(stream);
+}
+#define cudaStreamSynchronize strata_hip_stream_synchronize
+#else
 #define cudaStreamSynchronize hipStreamSynchronize
+#endif
 #define cudaStreamWaitEvent hipStreamWaitEvent
 #define cudaStream_t hipStream_t
 #define cudaSuccess hipSuccess

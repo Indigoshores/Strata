@@ -49,6 +49,32 @@ __device__ __forceinline__ float warp_sum(float v) {
 }
 __device__ __forceinline__ float sigmoidf_(float x) { return 1.0f / (1.0f + __expf(-x)); }
 
+#if !defined(STRATA_GR_FAST_LDS)
+#if defined(__HIP_PLATFORM_AMD__) && (defined(__gfx1151__) || defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1150__))
+#define STRATA_GR_FAST_LDS 1
+#else
+#define STRATA_GR_FAST_LDS 0
+#endif
+#endif
+
+#if STRATA_GR_FAST_LDS
+__device__ __forceinline__ void gr_sync_lds() {
+#if defined(__HIP_PLATFORM_AMD__) && defined(__gfx1151__)
+    __builtin_amdgcn_s_waitcnt(0x007f);
+    __builtin_amdgcn_s_barrier();
+#elif defined(__HIP_PLATFORM_AMD__)
+    asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+    __builtin_amdgcn_s_barrier();
+#else
+    __syncthreads();
+#endif
+}
+#else
+__device__ __forceinline__ void gr_sync_lds() {
+    __syncthreads();
+}
+#endif
+
 // 8 bf16 packed in a uint4, unpacked to two float4 once when reused across tokens.
 struct Bf16x8 { float4 a, b; };
 __device__ __forceinline__ Bf16x8 unpack8(const uint4 w) {
@@ -142,16 +168,16 @@ __global__ void __launch_bounds__(THREADS) gr_down_kernel(FusedGrArgs a) {
         const float v = warp_sum(ss[c]);
         if (lane == 0) part[warp][c] = v;
     }
-    __syncthreads();
+    gr_sync_lds();
     if (t < HC) {
         float s = 0.0f;
         for (int w = 0; w < WARPS; ++w) s += part[w][t];
         s_rs[t] = rsqrtf(s / (float) N + a.eps);
         if (blockIdx.x == 0) a.rs[t] = s_rs[t];
     }
-    __syncthreads();
+    gr_sync_lds();
     for (int i = t; i < D; i += THREADS) xn[i] *= s_rs[i / N];
-    __syncthreads();
+    gr_sync_lds();
     // 2. one warp per output row: 10240 bf16 = 1280 chunks of 8, 40 per lane.
     const bool inject_block = blockIdx.x == DOWN_BLOCKS;
     const int row = inject_block ? warp : blockIdx.x * WARPS + warp;
@@ -179,7 +205,7 @@ __global__ void __launch_bounds__(THREADS) gr_up_kernel(FusedGrArgs a) {
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
     const int d0 = blockIdx.x * UP_COLS;
     for (int k = t; k < LR; k += THREADS) lo[k] = a.lo[k];
-    __syncthreads();
+    gr_sync_lds();
     // 128 rows (4 streams x 32 columns), 16 per warp: 320 bf16 = 40 chunks of 8.
     for (int r = warp; r < HC * UP_COLS; r += WARPS) {
         const int c = r / UP_COLS, dd = r - c * UP_COLS, i = c * N + d0 + dd;
@@ -198,7 +224,7 @@ __global__ void __launch_bounds__(THREADS) gr_up_kernel(FusedGrArgs a) {
             g[c][dd] = x * sigmoidf_(acc);
         }
     }
-    __syncthreads();
+    gr_sync_lds();
     if (t < UP_COLS) {
         float s = 0.0f;
 #pragma unroll
@@ -279,14 +305,14 @@ __global__ void __launch_bounds__(THREADS) gr_norm_multi_kernel(GrMulti m) {
         const float v = warp_sum(ss[c]);
         if (lane == 0) part[warp][c] = v;
     }
-    __syncthreads();
+    gr_sync_lds();
     if (t < HC) {
         float s = 0.0f;
         for (int w = 0; w < WARPS; ++w) s += part[w][t];
         s_rs[t] = rsqrtf(s / (float) N + a.eps);
         a.rs[t] = s_rs[t];
     }
-    __syncthreads();
+    gr_sync_lds();
     for (int i = t; i < D; i += THREADS) xn[i] *= s_rs[i / N];
 }
 
@@ -323,14 +349,14 @@ __global__ void __launch_bounds__(THREADS) gr_down_multi_kernel(GrMulti m) {
 #pragma unroll
             for (int q = 0; q < TQ; ++q) wv[q] = ldw<Q8>(wmat, sq, row0 + (size_t) base + (size_t) (lane + 32 * q) * 8);
         }
-        __syncthreads();                                   // the previous tile is consumed
+        gr_sync_lds();                                   // the previous tile is consumed
         const float4* src4 = reinterpret_cast<const float4*>(m.xn);
         float4* tile4 = reinterpret_cast<float4*>(tile);
         for (int i = t; i < T * (TILEV / 4); i += THREADS) {
             const int k = i / (TILEV / 4), off = i - k * (TILEV / 4);
             tile4[i] = src4[((size_t) k * D + base) / 4 + off];
         }
-        __syncthreads();
+        gr_sync_lds();
         if (!active) continue;
 #pragma unroll
         for (int q = 0; q < TQ; ++q) {
