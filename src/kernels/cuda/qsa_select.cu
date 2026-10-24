@@ -1090,7 +1090,7 @@ __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_rows_kernel(con
     float4 qr[NQ][IDX_HEADS];
 #pragma unroll
     for (int qi = 0; qi < NQ; ++qi)
-#if defined(__HIP_PLATFORM_AMD__) && __clang_major__ >= 19
+#if defined(__HIP_PLATFORM_AMD__) && __clang_major__ >= 23
 #pragma unroll 1
 #else
 #pragma unroll
@@ -1110,7 +1110,7 @@ __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_rows_kernel(con
             if (b > n_bid) continue;
             const float4 k4 = (b == n_bid) ? kd : kp;
             float d[IDX_HEADS];
-#if defined(__HIP_PLATFORM_AMD__) && __clang_major__ >= 19
+#if defined(__HIP_PLATFORM_AMD__) && __clang_major__ >= 23
 #pragma unroll 1
 #else
 #pragma unroll
@@ -1636,7 +1636,7 @@ __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_halve_kernel(co
         for (int qi = 0; qi < NQ; ++qi) {
             const float4 k4 = (b == s_nbid_r[qi]) ? kd : kp;
             const float* q = qs + qi * IDX_HEADS * IDX_DIM + lane * 4;
-#if defined(__HIP_PLATFORM_AMD__) && __clang_major__ >= 19
+#if defined(__HIP_PLATFORM_AMD__) && __clang_major__ >= 23
 #pragma unroll 1
 #else
 #pragma unroll

@@ -426,6 +426,20 @@ static int64_t pf_switch_min_t() {   // S23: STRATA_PF_SWITCH_MIN_T=N - the roun
     static const int64_t v = [] { const char* e = std::getenv("STRATA_PF_SWITCH_MIN_T"); return e ? (int64_t) std::atoll(e) : (int64_t) 0; }();
     return v;
 }
+static int64_t pf_side_stream_min_t() {
+    // Windows WDDM cross-stream event latency gate: event record + wait costs 15-25 us/layer (~1-1.5 ms total).
+    // Overlapped GEMMs complete in <50 us for T < 1024, so gate behind T >= side_stream_min_t.
+    // STRATA_PF_SIDE_STREAM_MIN_T=0 restores unconditional side-stream behavior cleanly.
+    static const int64_t v = [] {
+        const char* e = std::getenv("STRATA_PF_SIDE_STREAM_MIN_T");
+        if (e != nullptr) {
+            int64_t val = (int64_t) std::atoll(e);
+            return val < 0 ? (int64_t) 0 : val;
+        }
+        return (int64_t) 1024;
+    }();
+    return v;
+}
 inline bool hc_upmix() {
     static const bool v = [] { const char* e = std::getenv("STRATA_HC_UPMIX"); return e != nullptr && e[0] == '1'; }();
     return v;
@@ -3038,7 +3052,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     pt.mark(kPfGdn, cs);
                     float* state = ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats;
                     float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
-                    const bool z_stream_on = (m.side_stream != nullptr) && []() {
+                    const bool z_stream_on = (m.side_stream != nullptr) && (T >= pf_side_stream_min_t()) && []() {
                         const char* v = std::getenv("STRATA_PF_Z_STREAM");
                         return v == nullptr || std::atoi(v) != 0;
                     }();
@@ -3434,7 +3448,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         if (s != m.cs) m.gemm.set_stream(m.cs);
                         return true;
                     };
-                    const bool sh_stream_opt = (m.side_stream != nullptr) && fused_l && []() {
+                    const bool sh_stream_opt = (m.side_stream != nullptr) && fused_l && (T >= pf_side_stream_min_t()) && []() {
                         const char* v = std::getenv("STRATA_SH_STREAM");
                         return v == nullptr || v[0] != '0';
                     }();
