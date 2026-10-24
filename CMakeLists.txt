@@ -1251,6 +1251,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_link_libraries(test_expert_bulk_load PRIVATE strata_engine ${_strata_gpu_runtime_target})
   add_test(NAME test_expert_bulk_load COMMAND test_expert_bulk_load)
 
+  # Pass 5.3: 3-Bucket variable-height MoE tile partitioner test
+  add_executable(test_moe_tile_bucketing tests/test_moe_tile_bucketing.cu)
+  target_include_directories(test_moe_tile_bucketing PRIVATE include ${_strata_gpu_include_directories})
+  target_link_libraries(test_moe_tile_bucketing PRIVATE strata_engine ${_strata_gpu_runtime_target})
+  add_test(NAME test_moe_tile_bucketing COMMAND test_moe_tile_bucketing)
+
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(pinned_shared_test src/core/pinned_shared_test.cpp)
     target_link_libraries(pinned_shared_test PRIVATE strata_core ${_strata_gpu_runtime_target})
