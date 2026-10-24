@@ -111,6 +111,8 @@ func main() {
 		`C:\Users\Butch\Documents\02_Apps\Strata\build-pass3\hip_prefill_hipblaslt_gemm.exe`,
 		`C:\Users\Butch\Documents\02_Apps\Strata\build-pass3\tune_hipblaslt.exe`,
 		`C:\Users\Butch\Documents\02_Apps\Strata\tools\hip\gfx1151-hipblaslt-100500.txt`,
+		`C:\Users\Butch\Documents\10-Models\Strata\engine\amdhip64_7.dll`,
+		`C:\Program Files\AMD\ROCm\7.2\bin\amd_comgr.dll`,
 	}
 
 	for _, b := range filesToCopy {
@@ -125,5 +127,12 @@ func main() {
 		} else {
 			fmt.Printf("Copied %s (%d bytes, sha256: %s)\n", filepath.Base(b), sz, h)
 		}
+	}
+
+	fmt.Println("\n=== Final Staging Inventory ===")
+	entries, _ := os.ReadDir(stageDir)
+	for _, e := range entries {
+		info, _ := e.Info()
+		fmt.Printf("  %-35s %12d bytes\n", e.Name(), info.Size())
 	}
 }

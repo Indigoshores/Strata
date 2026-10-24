@@ -3043,18 +3043,16 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         return v == nullptr || std::atoi(v) != 0;
                     }();
                     if (z_stream_on) {
-                        cudaEventRecord(m.side_start, m.cs);
-                        cudaStreamWaitEvent(m.side_stream, m.side_start, 0);
-                        m.gemm.set_stream(m.side_stream);
-                        if (!native_proj(m.gemm, wg, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err)) {
-                            m.gemm.set_stream(m.cs);
-                            return false;
-                        }
-                        cudaEventRecord(m.side_done, m.side_stream);
-                        m.gemm.set_stream(m.cs);
                         if (!native_proj(m.gemm, wqkv, m.mixed_h, m.qkv, T, v.name("attn_qkv.weight"), err)) return false;
                         if (!bf16_proj(m.gemm, wa, m.mixed_bf, m.ab, T, v.name("ssm_alpha.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
                         if (!bf16_proj(m.gemm, wb, m.mixed_bf, m.ab + HV, T, v.name("ssm_beta.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
+                        cudaEventRecord(m.side_start, m.cs);
+                        cudaStreamWaitEvent(m.side_stream, m.side_start, 0);
+                        m.gemm.set_stream(m.side_stream);
+                        const bool ok_z = native_proj(m.gemm, wg, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err);
+                        cudaEventRecord(m.side_done, m.side_stream);
+                        m.gemm.set_stream(m.cs);
+                        if (!ok_z) return false;
                         pt.mark(kPfGdnConv, cs);
                         gdn_gates(m.ab, (const float*) wdt->data, (const float*) wsa->data, m.gate, m.beta, T, m.cs);
                         gdn_conv(conv, m.qkv, (const float*) wc->data, m.hbuf, T, EPS, m.cs);
@@ -3385,8 +3383,37 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             }
                         }
                     }
+                    // #136: STRATA_PF_FUSED=1 - the Q2_0 pack's experts on the fused int8 kernels (moe_fused.hpp),
+                    // grouped on the GPU: no host sync.  Only where every expert's place is known before the routing -
+                    // the streamed walk, in which every non-resident expert of the layer comes through the ring in id
+                    // order - and where the MMQ buffers exist: they hold the fused path's own (the per-token int8
+                    // activations in Xq, the int8 H in H, the grouping tables in GU).  Chunks below stream_all_min()
+                    // keep MMQ; without the variable nothing here runs.  A native pack's layer takes the native kernels
+                    // (moe_fused_iq.hpp) where they cover its two formats, else MMQ (or the FP16 path: IQ1_M).
+                    const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+                    const bool use_mmq = mmq_plan().any && mmq_plan().layer[(size_t) l];
+                    const int mmq_gt = lay.native ? lay.fmt[(size_t) l].gu_type : 42;
+                    const int mmq_dt = lay.native ? lay.fmt[(size_t) l].d_type : 42;
+                    // --peer-device: MMQ only, whether or not the peer took the prompt path (set_peer can decline), as
+                    // fused_ring() sized the ring and the buffers for it
+                    const bool no_peer = !core::peer_portable();
+                    const bool fused_only = mmq_plan().any && mmq_plan().fo[(size_t) l];
+                    const bool fused_nat = (use_mmq || fused_only) && stream_all && no_peer && lay.native && fused::native_supported(mmq_gt, mmq_dt);
+                    const bool fused_l = (use_mmq && stream_all && no_peer && !lay.native && fused::enabled()) || fused_nat;
+
                     // the shared expert and its scalar gate
                     bool shared_on_side = false;
+                    struct SharedGuard {
+                        cudaStream_t s;
+                        bool& active;
+                        ~SharedGuard() {
+                            if (active) {
+                                if (s) cudaStreamSynchronize(s);
+                                active = false;
+                            }
+                        }
+                    } shared_guard{m.side_stream, shared_on_side};
+
                     auto shared_expert = [&](cudaStream_t s) -> bool {
                         if (s != m.cs) m.gemm.set_stream(s);
                         const bool ok = native_proj(m.gemm, wsg, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err) &&
@@ -3407,7 +3434,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         if (s != m.cs) m.gemm.set_stream(m.cs);
                         return true;
                     };
-                    const bool sh_stream_opt = (m.side_stream != nullptr) && []() {
+                    const bool sh_stream_opt = (m.side_stream != nullptr) && fused_l && []() {
                         const char* v = std::getenv("STRATA_SH_STREAM");
                         return v == nullptr || v[0] != '0';
                     }();
@@ -3421,23 +3448,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     } else if (!defer_shared) {
                         if (!shared_expert(m.cs)) return false;
                     }
-                    // #136: STRATA_PF_FUSED=1 - the Q2_0 pack's experts on the fused int8 kernels (moe_fused.hpp),
-                    // grouped on the GPU: no host sync.  Only where every expert's place is known before the routing -
-                    // the streamed walk, in which every non-resident expert of the layer comes through the ring in id
-                    // order - and where the MMQ buffers exist: they hold the fused path's own (the per-token int8
-                    // activations in Xq, the int8 H in H, the grouping tables in GU).  Chunks below stream_all_min()
-                    // keep MMQ; without the variable nothing here runs.  A native pack's layer takes the native kernels
-                    // (moe_fused_iq.hpp) where they cover its two formats, else MMQ (or the FP16 path: IQ1_M).
-                    const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
-                    const bool use_mmq = mmq_plan().any && mmq_plan().layer[(size_t) l];
-                    const int mmq_gt = lay.native ? lay.fmt[(size_t) l].gu_type : 42;
-                    const int mmq_dt = lay.native ? lay.fmt[(size_t) l].d_type : 42;
-                    // --peer-device: MMQ only, whether or not the peer took the prompt path (set_peer can decline), as
-                    // fused_ring() sized the ring and the buffers for it
-                    const bool no_peer = !core::peer_portable();
-                    const bool fused_only = mmq_plan().any && mmq_plan().fo[(size_t) l];
-                    const bool fused_nat = (use_mmq || fused_only) && stream_all && no_peer && lay.native && fused::native_supported(mmq_gt, mmq_dt);
-                    const bool fused_l = (use_mmq && stream_all && no_peer && !lay.native && fused::enabled()) || fused_nat;
                     // #583 / #954: the fused layout's GU/H/Xq hold the grouping tables and the int8 rows, sized for
                     // stream_all_min() - 1 tokens of MMQ's rows, so a layer that takes MMQ or the FP16 path at the FULL
                     // chunk would write T*K rows into a (stream_all_min() - 1)*K-row buffer: an illegal access, or a kernel

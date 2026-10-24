@@ -50,30 +50,20 @@ __device__ __forceinline__ float warp_sum(float v) {
 __device__ __forceinline__ float sigmoidf_(float x) { return 1.0f / (1.0f + __expf(-x)); }
 
 #if !defined(STRATA_GR_FAST_LDS)
-#if defined(__HIP_PLATFORM_AMD__) && (defined(__gfx1151__) || defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1150__))
-#define STRATA_GR_FAST_LDS 1
-#else
 #define STRATA_GR_FAST_LDS 0
 #endif
-#endif
 
+__device__ __forceinline__ void gr_sync_lds() {
 #if STRATA_GR_FAST_LDS
-__device__ __forceinline__ void gr_sync_lds() {
-#if defined(__HIP_PLATFORM_AMD__) && defined(__gfx1151__)
-    __builtin_amdgcn_s_waitcnt(0x007f);
-    __builtin_amdgcn_s_barrier();
-#elif defined(__HIP_PLATFORM_AMD__)
-    asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
-    __builtin_amdgcn_s_barrier();
+#if defined(__HIP_PLATFORM_AMD__)
+    asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
+#else
+    __syncthreads();
+#endif
 #else
     __syncthreads();
 #endif
 }
-#else
-__device__ __forceinline__ void gr_sync_lds() {
-    __syncthreads();
-}
-#endif
 
 // 8 bf16 packed in a uint4, unpacked to two float4 once when reused across tokens.
 struct Bf16x8 { float4 a, b; };

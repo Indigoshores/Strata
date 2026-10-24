@@ -36,7 +36,7 @@ cmake -G Ninja -S "%SRC%" -B "%BUILD_DIR%" ^
   "-DCMAKE_HIP_FLAGS=--rocm-path=%ROCM_F% --rocm-device-lib-path=%BITCODE%" ^
   "-DSTRATA_GGML_DIR=%GGML_SRC%" || exit /b 1
 
-echo Building targets strata, strata-device, native_iq_wmma_config_test, lookahead_policy_test, hip_prefill_hipblaslt_gemm, tune_hipblaslt with --parallel 6...
-cmake --build "%BUILD_DIR%" --parallel 6 --target strata strata-device native_iq_wmma_config_test lookahead_policy_test hip_prefill_hipblaslt_gemm tune_hipblaslt || exit /b 1
+echo Building targets strata, strata-device, tests with --parallel 6...
+cmake --build "%BUILD_DIR%" --parallel 6 --target strata strata-device native_iq_wmma_config_test lookahead_policy_test hip_prefill_hipblaslt_gemm tune_hipblaslt hip_gdn_chunked hip_gdn_rec_head gr_multi_parity hip_native_qsa_score hip_intrinsics hip_router_fast || exit /b 1
 
 echo Pass 3 Build finished successfully!

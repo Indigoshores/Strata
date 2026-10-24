@@ -58,7 +58,6 @@ std::vector<std::pair<std::string, std::string>> arch_default_env(const char* gc
         {"STRATA_PF_Z_STREAM", "1"},     // GDN Z-projection side-stream overlap (Gufo #758 da4d8b82)
         {"STRATA_GDN_CHUNKED", "1"},     // chunked DeltaNet recurrence on gfx11 matrix cores (Gufo #758 29e900c9)
         {"STRATA_WDDM_FLUSH", "1"},      // scoped WDDM decode flush before host wait (Gufo 2eb0778a)
-        {"STRATA_WDDM_COPY_KERNEL", "1"},// small D2D copy kernels on compute queue avoiding DMA context switches
     };
     return t;
 }

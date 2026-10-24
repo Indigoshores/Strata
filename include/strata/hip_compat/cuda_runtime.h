@@ -111,7 +111,7 @@ inline hipError_t strata_hip_memcpy_async(void* dst, const void* src, size_t byt
     if (kind == hipMemcpyDeviceToDevice && bytes > 0 && bytes <= (16ull << 20)) {
         static const bool s_use_kernel = []() {
             const char* env = std::getenv("STRATA_WDDM_COPY_KERNEL");
-            return env ? (std::atoi(env) != 0) : true;
+            return env ? (std::atoi(env) != 0) : false;
         }();
         if (s_use_kernel) {
             return strata_wddm_d2d_copy(dst, src, bytes, stream);
