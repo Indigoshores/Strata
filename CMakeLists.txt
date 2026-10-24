@@ -1723,6 +1723,11 @@ if(STRATA_NATIVE_EXPERTS)
       target_link_libraries(prefill_fused_iq_test PRIVATE strata_mmq ggml-base ${_strata_gpu_runtime_target})
       add_test(NAME prefill_fused_iq_test COMMAND prefill_fused_iq_test)
       set_tests_properties(prefill_fused_iq_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+      # Pass 5.4: 3-Bucket variable-height MoE WMMA parity & latency benchmark
+      add_executable(test_moe_variable_tiles tests/test_moe_variable_tiles.cu)
+      target_link_libraries(test_moe_variable_tiles PRIVATE strata_mmq ggml-base ${_strata_gpu_runtime_target})
+      add_test(NAME test_moe_variable_tiles COMMAND test_moe_variable_tiles)
+      set_tests_properties(test_moe_variable_tiles PROPERTIES TIMEOUT 300)
       # the MoE input quantized per token and scattered to its rows (mmq::quantize_scatter) against the per-row
       # gather: the same q8_1 bytes for every MMQ layout (--bench: both at 2K, 8K and 32K tokens)
       add_executable(prefill_mmq_scatter_test tests/cuda/prefill_mmq_scatter_test.cpp)
@@ -1816,6 +1821,16 @@ if(STRATA_NATIVE_EXPERTS)
     add_test(NAME hip_prefill_fused_iq_f16 COMMAND hip_prefill_fused_iq)
     set_tests_properties(hip_prefill_fused_iq_f16 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600 ENVIRONMENT "STRATA_PF_F16=1;STRATA_PF_F16_KQ=1")
     list(APPEND _strata_hip_tests hip_prefill_fused_iq)
+
+    # Pass 5.4: 3-Bucket variable-height MoE WMMA parity & latency benchmark
+    add_executable(test_moe_variable_tiles tests/test_moe_variable_tiles.cu)
+    set_source_files_properties(tests/test_moe_variable_tiles.cu PROPERTIES LANGUAGE HIP
+                                INCLUDE_DIRECTORIES "${STRATA_HIP_COMPAT_INCLUDE_DIR}")
+    target_include_directories(test_moe_variable_tiles PRIVATE "${_strata_gg}/include")
+    target_link_libraries(test_moe_variable_tiles PRIVATE strata_mmq ggml-base strata_hip_runtime)
+    add_test(NAME test_moe_variable_tiles COMMAND test_moe_variable_tiles)
+    set_tests_properties(test_moe_variable_tiles PROPERTIES TIMEOUT 300)
+    list(APPEND _strata_hip_tests test_moe_variable_tiles)
 
     # Numerical diagnostic: synthetic layouts by default, optional first-expert IQ3_XXS/IQ4_NL check with a pack.
     add_executable(hip_prefill_mmq_parity tests/hip/prefill_mmq_parity.cpp)
