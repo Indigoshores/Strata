@@ -377,4 +377,32 @@ void* DeviceArena::alloc(uint64_t bytes, uint64_t align) {
     return (char*) base_ + start;
 }
 
+#if defined(_WIN32)
+namespace {
+__global__ void wddm_copy_words_kernel(const uint32_t* __restrict__ src, uint32_t* __restrict__ dst, size_t n_words) {
+    const size_t i = (size_t)blockIdx.x * (size_t)blockDim.x + (size_t)threadIdx.x;
+    if (i < n_words) dst[i] = src[i];
+}
+__global__ void wddm_copy_bytes_kernel(const uint8_t* __restrict__ src, uint8_t* __restrict__ dst, size_t n_bytes) {
+    const size_t i = (size_t)blockIdx.x * (size_t)blockDim.x + (size_t)threadIdx.x;
+    if (i < n_bytes) dst[i] = src[i];
+}
+} // namespace
+
+extern "C" cudaError_t strata_wddm_d2d_copy(void* dst, const void* src, size_t bytes, cudaStream_t stream) {
+    if (bytes == 0) return cudaSuccess;
+    if ((bytes % 4 == 0) && (reinterpret_cast<uintptr_t>(src) % 4 == 0) && (reinterpret_cast<uintptr_t>(dst) % 4 == 0)) {
+        const size_t words = bytes / 4;
+        constexpr unsigned kThreads = 256;
+        const unsigned blocks = static_cast<unsigned>((words + kThreads - 1) / kThreads);
+        wddm_copy_words_kernel<<<blocks, kThreads, 0, stream>>>(static_cast<const uint32_t*>(src), static_cast<uint32_t*>(dst), words);
+    } else {
+        constexpr unsigned kThreads = 256;
+        const unsigned blocks = static_cast<unsigned>((bytes + kThreads - 1) / kThreads);
+        wddm_copy_bytes_kernel<<<blocks, kThreads, 0, stream>>>(static_cast<const uint8_t*>(src), static_cast<uint8_t*>(dst), bytes);
+    }
+    return cudaGetLastError();
+}
+#endif
+
 }  // namespace strata::core

@@ -55,6 +55,10 @@ std::vector<std::pair<std::string, std::string>> arch_default_env(const char* gc
         {"STRATA_QFUSE", "1"},           // activation q8_1 images written by their producers (S26)
         {"STRATA_PLE_BATCH", "1"},       // the verify window's PLE key / value projections at once (S25)
         {"STRATA_SH_STREAM", "1"},       // the shared expert on its own stream: decode +1.8% / +6.7% (UD-Q4_K_XL) (140-m)
+        {"STRATA_PF_Z_STREAM", "1"},     // GDN Z-projection side-stream overlap (Gufo #758 da4d8b82)
+        {"STRATA_GDN_CHUNKED", "1"},     // chunked DeltaNet recurrence on gfx11 matrix cores (Gufo #758 29e900c9)
+        {"STRATA_WDDM_FLUSH", "1"},      // scoped WDDM decode flush before host wait (Gufo 2eb0778a)
+        {"STRATA_WDDM_COPY_KERNEL", "1"},// small D2D copy kernels on compute queue avoiding DMA context switches
     };
     return t;
 }

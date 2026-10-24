@@ -1090,7 +1090,11 @@ __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_rows_kernel(con
     float4 qr[NQ][IDX_HEADS];
 #pragma unroll
     for (int qi = 0; qi < NQ; ++qi)
+#if defined(__HIP_PLATFORM_AMD__) && __clang_major__ >= 19
+#pragma unroll 1
+#else
 #pragma unroll
+#endif
         for (int h = 0; h < IDX_HEADS; ++h)
             qr[qi][h] = qi < nq ? *reinterpret_cast<const float4*>(q_idx + qi * IDX_HEADS * IDX_DIM + h * IDX_DIM + lane * 4)
                                 : make_float4(0.f, 0.f, 0.f, 0.f);
@@ -1106,7 +1110,11 @@ __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_rows_kernel(con
             if (b > n_bid) continue;
             const float4 k4 = (b == n_bid) ? kd : kp;
             float d[IDX_HEADS];
+#if defined(__HIP_PLATFORM_AMD__) && __clang_major__ >= 19
+#pragma unroll 1
+#else
 #pragma unroll
+#endif
             for (int h = 0; h < IDX_HEADS; ++h) {
                 const float4 q4 = qr[qi][h];
                 d[h] = k4.x * q4.x + k4.y * q4.y + k4.z * q4.z + k4.w * q4.w;
@@ -1628,7 +1636,11 @@ __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_halve_kernel(co
         for (int qi = 0; qi < NQ; ++qi) {
             const float4 k4 = (b == s_nbid_r[qi]) ? kd : kp;
             const float* q = qs + qi * IDX_HEADS * IDX_DIM + lane * 4;
+#if defined(__HIP_PLATFORM_AMD__) && __clang_major__ >= 19
+#pragma unroll 1
+#else
 #pragma unroll
+#endif
             for (int h = 0; h < IDX_HEADS; ++h) {
                 float4 q4;
                 if constexpr (QREG) q4 = qr[qi * IDX_HEADS + h];

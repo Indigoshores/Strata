@@ -69,6 +69,7 @@ public:
     uint16_t* scratch() const { return scratch_; }
     int64_t scratch_elems() const { return scratch_elems_; }
     void* stream() const { return stream_; }
+    void set_stream(void* stream);
 
 private:
     void* handle_ = nullptr;

@@ -864,6 +864,8 @@ struct Prefill::Impl {
     int64_t T = 0, T_max = 0;
     bool borrowed = false, borrow_spill = false;
     cudaStream_t cs = nullptr, copy = nullptr;
+    cudaStream_t side_stream = nullptr;
+    cudaEvent_t side_start = nullptr, side_done = nullptr;
     Gemm gemm;
     std::vector<void*> owned;
     // chunk buffers
@@ -1046,6 +1048,13 @@ void Prefill::release() {
     if (!impl_) return;
     impl_->hand_worker.reset();   // idle here (run drains the chain before it returns); joins its thread
     if (impl_->cs) cudaStreamSynchronize(impl_->cs);
+    if (impl_->side_stream) {
+        cudaStreamSynchronize(impl_->side_stream);
+        cudaStreamDestroy(impl_->side_stream);
+        impl_->side_stream = nullptr;
+    }
+    if (impl_->side_start) { cudaEventDestroy(impl_->side_start); impl_->side_start = nullptr; }
+    if (impl_->side_done) { cudaEventDestroy(impl_->side_done); impl_->side_done = nullptr; }
     if (impl_->copy) cudaStreamSynchronize(impl_->copy);
     if (impl_->kv_copy) cudaStreamSynchronize(impl_->kv_copy);
     for (int i = 0; i < RING_MAX; ++i) {
@@ -1243,6 +1252,11 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
 #endif
     m.wt = &wt; m.g = &g; m.ss = &ss; m.src = src; m.cache = cache; m.host_res = host_res;
     m.T = chunk; m.cs = (cudaStream_t) stream; m.stats = &stats_;
+    if (m.side_stream == nullptr) {
+        cudaStreamCreateWithFlags(&m.side_stream, cudaStreamNonBlocking);
+        cudaEventCreateWithFlags(&m.side_start, cudaEventDisableTiming);
+        cudaEventCreateWithFlags(&m.side_done, cudaEventDisableTiming);
+    }
     if (g.n_embd != N || g.hc != HC || g.hc_lr != LR || g.n_expert < 1 || ss.k != K) {
         err = "prefill: geometry differs from the artifact's"; return false;
     }
@@ -3024,13 +3038,36 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     pt.mark(kPfGdn, cs);
                     float* state = ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats;
                     float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
-                    if (!native_proj(m.gemm, wqkv, m.mixed_h, m.qkv, T, v.name("attn_qkv.weight"), err)) return false;
-                    if (!native_proj(m.gemm, wg, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err)) return false;
-                    if (!bf16_proj(m.gemm, wa, m.mixed_bf, m.ab, T, v.name("ssm_alpha.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
-                    if (!bf16_proj(m.gemm, wb, m.mixed_bf, m.ab + HV, T, v.name("ssm_beta.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
-                    pt.mark(kPfGdnConv, cs);   // "gdn" is the projections in; the rest on their own lines
-                    gdn_gates(m.ab, (const float*) wdt->data, (const float*) wsa->data, m.gate, m.beta, T, m.cs);
-                    gdn_conv(conv, m.qkv, (const float*) wc->data, m.hbuf, T, EPS, m.cs);
+                    const bool z_stream_on = (m.side_stream != nullptr) && []() {
+                        const char* v = std::getenv("STRATA_PF_Z_STREAM");
+                        return v == nullptr || std::atoi(v) != 0;
+                    }();
+                    if (z_stream_on) {
+                        cudaEventRecord(m.side_start, m.cs);
+                        cudaStreamWaitEvent(m.side_stream, m.side_start, 0);
+                        m.gemm.set_stream(m.side_stream);
+                        if (!native_proj(m.gemm, wg, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err)) {
+                            m.gemm.set_stream(m.cs);
+                            return false;
+                        }
+                        cudaEventRecord(m.side_done, m.side_stream);
+                        m.gemm.set_stream(m.cs);
+                        if (!native_proj(m.gemm, wqkv, m.mixed_h, m.qkv, T, v.name("attn_qkv.weight"), err)) return false;
+                        if (!bf16_proj(m.gemm, wa, m.mixed_bf, m.ab, T, v.name("ssm_alpha.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
+                        if (!bf16_proj(m.gemm, wb, m.mixed_bf, m.ab + HV, T, v.name("ssm_beta.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
+                        pt.mark(kPfGdnConv, cs);
+                        gdn_gates(m.ab, (const float*) wdt->data, (const float*) wsa->data, m.gate, m.beta, T, m.cs);
+                        gdn_conv(conv, m.qkv, (const float*) wc->data, m.hbuf, T, EPS, m.cs);
+                        cudaStreamWaitEvent(m.cs, m.side_done, 0);
+                    } else {
+                        if (!native_proj(m.gemm, wqkv, m.mixed_h, m.qkv, T, v.name("attn_qkv.weight"), err)) return false;
+                        if (!native_proj(m.gemm, wg, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err)) return false;
+                        if (!bf16_proj(m.gemm, wa, m.mixed_bf, m.ab, T, v.name("ssm_alpha.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
+                        if (!bf16_proj(m.gemm, wb, m.mixed_bf, m.ab + HV, T, v.name("ssm_beta.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
+                        pt.mark(kPfGdnConv, cs);   // "gdn" is the projections in; the rest on their own lines
+                        gdn_gates(m.ab, (const float*) wdt->data, (const float*) wsa->data, m.gate, m.beta, T, m.cs);
+                        gdn_conv(conv, m.qkv, (const float*) wc->data, m.hbuf, T, EPS, m.cs);
+                    }
                     pt.mark(kPfGdnRec, cs);
                     const int64_t ld_y = pf_pad() && T >= std::max<int64_t>(pf_switch_min_t(), 64) ? ZV + ZV_PAD : 0;
                     gdn_recurrence(state, m.hbuf, m.gate, m.beta, m.z, (const float*) wnm->data, EPS, m.y, m.y_h, T, m.cs,
@@ -3349,20 +3386,41 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         }
                     }
                     // the shared expert and its scalar gate
-                    auto shared_expert = [&]() -> bool {
-                        if (!native_proj(m.gemm, wsg, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err)) return false;
-                        if (!native_proj(m.gemm, wsu, m.mixed_h, m.sup, T, v.name("ffn_up_shexp.weight"), err)) return false;
-                        swiglu_pair(m.sgate, m.sup, m.sh_h, T, m.cs);
-                        if (!native_proj(m.gemm, wsd, m.sh_h, m.shared, T, v.name("ffn_down_shexp.weight"), err)) return false;
-                        if (wgi->kind != core::WeightKind::Bf16InF32) { err = "prefill: shared gate is not BF16"; return false; }
+                    bool shared_on_side = false;
+                    auto shared_expert = [&](cudaStream_t s) -> bool {
+                        if (s != m.cs) m.gemm.set_stream(s);
+                        const bool ok = native_proj(m.gemm, wsg, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err) &&
+                                        native_proj(m.gemm, wsu, m.mixed_h, m.sup, T, v.name("ffn_up_shexp.weight"), err);
+                        if (!ok) { if (s != m.cs) m.gemm.set_stream(m.cs); return false; }
+                        swiglu_pair(m.sgate, m.sup, m.sh_h, T, s);
+                        if (!native_proj(m.gemm, wsd, m.sh_h, m.shared, T, v.name("ffn_down_shexp.weight"), err)) {
+                            if (s != m.cs) m.gemm.set_stream(m.cs);
+                            return false;
+                        }
+                        if (wgi->kind != core::WeightKind::Bf16InF32) {
+                            if (s != m.cs) m.gemm.set_stream(m.cs);
+                            err = "prefill: shared gate is not BF16";
+                            return false;
+                        }
                         m.gemm.bf16(m.mixed_bf, (const uint16_t*) wgi->data, m.sg, T, 1, N);
                         if (m.mixed_bf_lo) m.gemm.bf16(m.mixed_bf_lo, (const uint16_t*) wgi->data, m.sg, T, 1, N, 0, 1.0f);
+                        if (s != m.cs) m.gemm.set_stream(m.cs);
                         return true;
                     };
-                    // Only the router needs to finish before readback. Queue the shared expert afterwards
-                    // so it can overlap CPU grouping and the routed-only path's initial expert uploads.
-                    const bool defer_shared = !stream_all && stream_ahead_enabled();
-                    if (!defer_shared && !shared_expert()) return false;
+                    const bool sh_stream_opt = (m.side_stream != nullptr) && []() {
+                        const char* v = std::getenv("STRATA_SH_STREAM");
+                        return v == nullptr || v[0] != '0';
+                    }();
+                    const bool defer_shared = !sh_stream_opt && !stream_all && stream_ahead_enabled();
+                    if (sh_stream_opt) {
+                        cudaEventRecord(m.side_start, m.cs);
+                        cudaStreamWaitEvent(m.side_stream, m.side_start, 0);
+                        if (!shared_expert(m.side_stream)) return false;
+                        cudaEventRecord(m.side_done, m.side_stream);
+                        shared_on_side = true;
+                    } else if (!defer_shared) {
+                        if (!shared_expert(m.cs)) return false;
+                    }
                     // #136: STRATA_PF_FUSED=1 - the Q2_0 pack's experts on the fused int8 kernels (moe_fused.hpp),
                     // grouped on the GPU: no host sync.  Only where every expert's place is known before the routing -
                     // the streamed walk, in which every non-resident expert of the layer comes through the ring in id
@@ -3585,9 +3643,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         if (pe.on) {   // the peer's marks so far are done: the primary waited for its last rows
                             int pd = 0; cudaGetDevice(&pd); cudaSetDevice(pe.dev); cudaStreamSynchronize(m.pp->s); pe.fold(); cudaSetDevice(pd);
                         }
-                        if (defer_shared) {
+                        if (!sh_stream_opt && defer_shared) {
                             pt.mark(kPfRouter, cs);   // keep the existing router+shared timing attribution
-                            if (!shared_expert()) return false;
+                            if (!shared_expert(m.cs)) return false;
                             pt.mark(kPfHostGroup, cs);
                         }
                         std::fill(m.cnt.begin(), m.cnt.end(), 0);
@@ -4469,6 +4527,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         cudaStreamWaitEvent(m.cs, m.pp->ev_done, 0);
                         if (!m.pp->p2p && !m.pp->sums)
                             copy_f32_wide(m.Dm + (size_t) m.pp->back_at * N, m.pp->host_rows, m.pp->back_rows * N, m.cs);
+                    }
+                    if (shared_on_side) {
+                        cudaStreamWaitEvent(m.cs, m.side_done, 0);
+                        shared_on_side = false;
                     }
                     if (peer_now && m.pp->sums && m.pp->f16)
                         moe_combine_peer16(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.pp->host_sum16, m.pp->back_at, m.bo, T, m.cs);

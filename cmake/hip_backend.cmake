@@ -77,15 +77,39 @@ if(NOT TARGET roc::hipblas)
 endif()
 if(TARGET roc::hipblaslt)
   set(STRATA_HIPBLASLT_AVAILABLE ON)
+  if(WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/rocm100500-libs/libhipblaslt.lib")
+    set_target_properties(roc::hipblaslt PROPERTIES
+      IMPORTED_IMPLIB "${CMAKE_CURRENT_SOURCE_DIR}/rocm100500-libs/libhipblaslt.lib"
+      IMPORTED_IMPLIB_RELEASE "${CMAKE_CURRENT_SOURCE_DIR}/rocm100500-libs/libhipblaslt.lib"
+      IMPORTED_IMPLIB_DEBUG "${CMAKE_CURRENT_SOURCE_DIR}/rocm100500-libs/libhipblaslt.lib"
+      IMPORTED_IMPLIB_RELWITHDEBINFO "${CMAKE_CURRENT_SOURCE_DIR}/rocm100500-libs/libhipblaslt.lib"
+      IMPORTED_IMPLIB_MINSIZEREL "${CMAKE_CURRENT_SOURCE_DIR}/rocm100500-libs/libhipblaslt.lib"
+    )
+    message(STATUS "Strata: Overrode roc::hipblaslt import library with rocm100500-libs/libhipblaslt.lib")
+  endif()
 else()
   set(STRATA_HIPBLASLT_AVAILABLE OFF)
   message(STATUS "Strata: hipBLASLt not found; solution-table dispatch is unavailable")
 endif()
 if(TARGET roc::rocblas)
   set(STRATA_ROCBLAS_AVAILABLE ON)
+  if(WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/rocm100500-libs/rocblas.lib")
+    set_target_properties(roc::rocblas PROPERTIES
+      IMPORTED_IMPLIB "${CMAKE_CURRENT_SOURCE_DIR}/rocm100500-libs/rocblas.lib"
+      IMPORTED_IMPLIB_RELEASE "${CMAKE_CURRENT_SOURCE_DIR}/rocm100500-libs/rocblas.lib"
+    )
+  endif()
 else()
   set(STRATA_ROCBLAS_AVAILABLE OFF)
   message(STATUS "Strata: rocBLAS CMake package not found; the rocBLAS solution table (gfx103x) is unavailable")
+endif()
+if(TARGET roc::hipblas)
+  if(WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/rocm100500-libs/hipblas.lib")
+    set_target_properties(roc::hipblas PROPERTIES
+      IMPORTED_IMPLIB "${CMAKE_CURRENT_SOURCE_DIR}/rocm100500-libs/hipblas.lib"
+      IMPORTED_IMPLIB_RELEASE "${CMAKE_CURRENT_SOURCE_DIR}/rocm100500-libs/hipblas.lib"
+    )
+  endif()
 endif()
 
 # HIP's link step produces a PIE; make Strata and ggml objects PIC for the ROCm linker.

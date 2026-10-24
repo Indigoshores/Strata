@@ -105,7 +105,25 @@ inline hipError_t strata_device_get_attribute(int* v, hipDeviceAttribute_t a, in
 #define cudaFree hipFree
 #define cudaMemGetInfo hipMemGetInfo
 #define cudaMemcpy hipMemcpy
+#if defined(_WIN32)
+extern "C" hipError_t strata_wddm_d2d_copy(void* dst, const void* src, size_t bytes, hipStream_t stream);
+
+inline hipError_t strata_hip_memcpy_async_compat(void* dst, const void* src, size_t bytes, hipMemcpyKind kind, hipStream_t stream = nullptr) {
+    if (kind == hipMemcpyDeviceToDevice && bytes > 0 && bytes <= (16ull << 20)) {
+        static const bool s_use_kernel = []() {
+            const char* env = std::getenv("STRATA_WDDM_COPY_KERNEL");
+            return env ? (std::atoi(env) != 0) : true;
+        }();
+        if (s_use_kernel) {
+            return strata_wddm_d2d_copy(dst, src, bytes, stream);
+        }
+    }
+    return hipMemcpyAsync(dst, src, bytes, kind, stream);
+}
+#define cudaMemcpyAsync strata_hip_memcpy_async_compat
+#else
 #define cudaMemcpyAsync hipMemcpyAsync
+#endif
 #define cudaMemcpyPeerAsync hipMemcpyPeerAsync
 #define cudaMemcpyPeer hipMemcpyPeer
 #define cudaMemcpy2DAsync hipMemcpy2DAsync
@@ -133,18 +151,23 @@ template <typename T> inline hipError_t strata_host_alloc(T** p, size_t bytes, u
 #define cudaStreamDestroy hipStreamDestroy
 #define cudaStreamQuery hipStreamQuery
 #define cudaStreamIsCapturing hipStreamIsCapturing
-#if defined(_WIN32)
-inline hipError_t strata_hip_compat_stream_sync(hipStream_t stream) {
-    hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
-    if (stream != nullptr && hipStreamIsCapturing(stream, &capture) == hipSuccess && capture == hipStreamCaptureStatusNone) {
-        (void)hipStreamQuery(stream);
-    }
-    return hipStreamSynchronize(stream);
-}
-#define cudaStreamSynchronize strata_hip_compat_stream_sync
-#else
 #define cudaStreamSynchronize hipStreamSynchronize
+inline void strata_wddm_flush(hipStream_t stream) {
+#if defined(_WIN32)
+    static const bool s_flush = []() {
+        const char* env = std::getenv("STRATA_WDDM_FLUSH");
+        return env ? (std::atoi(env) != 0) : true;
+    }();
+    if (s_flush && stream != nullptr) {
+        hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
+        if (hipStreamIsCapturing(stream, &capture) == hipSuccess && capture == hipStreamCaptureStatusNone) {
+            (void)hipStreamQuery(stream);
+        }
+    }
+#else
+    (void)stream;
 #endif
+}
 #define cudaStreamWaitEvent hipStreamWaitEvent
 #define cudaStreamBeginCapture hipStreamBeginCapture
 #define cudaStreamEndCapture hipStreamEndCapture
@@ -154,15 +177,7 @@ inline hipError_t strata_hip_compat_stream_sync(hipStream_t stream) {
 #define cudaEventDestroy hipEventDestroy
 #define cudaEventRecord hipEventRecord
 #define cudaEventQuery hipEventQuery
-#if defined(_WIN32)
-inline hipError_t strata_hip_compat_event_sync(hipEvent_t ev) {
-    (void)hipEventQuery(ev);
-    return hipEventSynchronize(ev);
-}
-#define cudaEventSynchronize strata_hip_compat_event_sync
-#else
 #define cudaEventSynchronize hipEventSynchronize
-#endif
 #define cudaEventElapsedTime hipEventElapsedTime
 #define cudaGraphLaunch hipGraphLaunch
 #define cudaGraphUpload hipGraphUpload

@@ -619,6 +619,19 @@ void Gemm::rebind(uint16_t* scratch, int64_t scratch_elems, void* workspace, siz
 #endif
 }
 
+void Gemm::set_stream(void* stream) {
+    stream_ = stream;
+    if (handle_) {
+        cublasSetStream((cublasHandle_t) handle_, (cudaStream_t) stream);
+    }
+#if defined(__HIPCC__) && defined(STRATA_ROCBLAS_AVAILABLE)
+    if (rocblas_state_) {
+        auto* state = static_cast<RocBlasState*>(rocblas_state_);
+        if (state->handle) rocblas_set_stream(state->handle, (hipStream_t) stream);
+    }
+#endif
+}
+
 bool Gemm::init(void* stream, int64_t scratch_elems, std::string& err) {
     // #240: every failure names the call and the real status, so "no VRAM" can be told from a broken install
     cublasHandle_t h = nullptr;
