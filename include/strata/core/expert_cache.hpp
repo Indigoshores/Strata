@@ -216,6 +216,45 @@ public:
 
     /// Slots filled so far, for the startup report.
     int64_t fills() const { return fills_; }
+    void increment_fills(int64_t count = 1) { fills_ += count; }
+
+    /// Bulk upload session for startup loading.
+    /// Double-buffered (2 x 16 MiB pinned host buffers) + non-blocking stream + events
+    /// to overlap multi-threaded host memcpy with GPU DMA, achieving 100% pipeline concurrency.
+    class BulkUploadSession {
+    public:
+        struct Item {
+            int32_t slot = -1;
+            const uint8_t* host_blob = nullptr;
+            int64_t bytes = 0;
+        };
+
+        explicit BulkUploadSession(ExpertCache& cache);
+        ~BulkUploadSession();
+        BulkUploadSession(const BulkUploadSession&) = delete;
+        BulkUploadSession& operator=(const BulkUploadSession&) = delete;
+
+        bool init(std::string& err);
+        bool upload(const Item* items, size_t count, std::string& err);
+        bool finish(std::string& err);
+
+        size_t retained_staging_bytes() const {
+            return (buf_[0] ? kRingBufferSize : 0) + (buf_[1] ? kRingBufferSize : 0);
+        }
+
+    private:
+        static constexpr size_t kRingBufferSize = 16 * 1024 * 1024;
+        ExpertCache& cache_;
+        uint8_t* buf_[2] = {nullptr, nullptr};
+        void* stream_ = nullptr;
+        void* events_[2] = {nullptr, nullptr};
+        bool event_recorded_[2] = {false, false};
+        int active_buf_ = 0;
+        bool initialized_ = false;
+
+        struct WorkerPool;
+        std::unique_ptr<WorkerPool> pool_;
+    };
 
     /// The elastic K/V (--kv-grow): the arena in a VMM range (vmm.hpp) instead of one cudaMalloc, so the K/V can take
     /// single chunks of it and give them back. Applies to the next `open`; ignored where VMM is not available.

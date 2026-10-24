@@ -1246,6 +1246,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_link_libraries(platform_memory_test PRIVATE strata_core ${_strata_gpu_runtime_target})
   add_test(NAME platform_memory_test COMMAND platform_memory_test)
 
+  # Pass 5.1: Bit-exact bulk upload and prefetch test
+  add_executable(test_expert_bulk_load tests/test_expert_bulk_load.cpp)
+  target_link_libraries(test_expert_bulk_load PRIVATE strata_engine ${_strata_gpu_runtime_target})
+  add_test(NAME test_expert_bulk_load COMMAND test_expert_bulk_load)
+
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(pinned_shared_test src/core/pinned_shared_test.cpp)
     target_link_libraries(pinned_shared_test PRIVATE strata_core ${_strata_gpu_runtime_target})

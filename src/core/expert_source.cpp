@@ -2593,7 +2593,7 @@ uint64_t FileExpertSource::release(int64_t layer, int64_t expert) {
 #if defined(_WIN32)
     static const bool enabled = [] {
         const char* v = std::getenv("STRATA_FILE_RELEASE");
-        return v != nullptr && std::strcmp(v, "1") == 0;
+        return v == nullptr || std::strcmp(v, "0") != 0;
     }();
     if (!enabled || base_ == nullptr || unmapped_ || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_)
         return 0;

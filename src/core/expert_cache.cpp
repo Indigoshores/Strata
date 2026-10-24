@@ -7,6 +7,9 @@
 #define STRATA_EC_NO_VMM 1
 #endif
 
+#include <condition_variable>
+#include <functional>
+#include <queue>
 #include <thread>
 #include <mutex>
 #include <cuda_runtime.h>
@@ -802,6 +805,286 @@ bool ExpertCache::verify_slot(int32_t slot, const uint8_t* host_blob, std::strin
         return false;
     }
     return true;
+}
+
+struct ExpertCache::BulkUploadSession::WorkerPool {
+    std::vector<std::thread> workers;
+    std::queue<std::function<void()>> tasks;
+    std::mutex mtx;
+    std::condition_variable cv;
+    std::condition_variable done_cv;
+    size_t in_flight = 0;
+    bool stop = false;
+
+    explicit WorkerPool(size_t n_workers) {
+        for (size_t i = 0; i < n_workers; ++i) {
+            workers.emplace_back([this] {
+                while (true) {
+                    std::function<void()> task;
+                    {
+                        std::unique_lock<std::mutex> lock(mtx);
+                        cv.wait(lock, [this] { return stop || !tasks.empty(); });
+                        if (stop && tasks.empty()) return;
+                        task = std::move(tasks.front());
+                        tasks.pop();
+                    }
+                    task();
+                    {
+                        std::unique_lock<std::mutex> lock(mtx);
+                        --in_flight;
+                        if (in_flight == 0 && tasks.empty()) {
+                            done_cv.notify_all();
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    void run_tasks(const std::vector<std::function<void()>>& batch_tasks) {
+        if (batch_tasks.empty()) return;
+        {
+            std::unique_lock<std::mutex> lock(mtx);
+            in_flight += batch_tasks.size();
+            for (const auto& t : batch_tasks) {
+                tasks.push(t);
+            }
+        }
+        cv.notify_all();
+        while (true) {
+            std::function<void()> task;
+            {
+                std::unique_lock<std::mutex> lock(mtx);
+                if (tasks.empty()) {
+                    if (in_flight > 0) {
+                        done_cv.wait(lock, [this] { return in_flight == 0; });
+                    }
+                    break;
+                }
+                task = std::move(tasks.front());
+                tasks.pop();
+            }
+            task();
+            {
+                std::unique_lock<std::mutex> lock(mtx);
+                --in_flight;
+                if (in_flight == 0 && tasks.empty()) {
+                    done_cv.notify_all();
+                    break;
+                }
+            }
+        }
+    }
+
+    ~WorkerPool() {
+        {
+            std::unique_lock<std::mutex> lock(mtx);
+            stop = true;
+        }
+        cv.notify_all();
+        for (auto& w : workers) {
+            if (w.joinable()) w.join();
+        }
+    }
+};
+
+ExpertCache::BulkUploadSession::BulkUploadSession(ExpertCache& cache) : cache_(cache) {}
+
+ExpertCache::BulkUploadSession::~BulkUploadSession() {
+    std::string err;
+    (void) finish(err);
+}
+
+bool ExpertCache::BulkUploadSession::init(std::string& err) {
+    if (initialized_) return true;
+
+    for (int i = 0; i < 2; ++i) {
+        cudaError_t e = cudaHostAlloc(reinterpret_cast<void**>(&buf_[i]), kRingBufferSize, cudaHostAllocDefault);
+        if (e != cudaSuccess) {
+            err = std::string("ExpertCache::BulkUploadSession: cudaHostAlloc failed: ") + cudaGetErrorString(e);
+            (void) finish(err);
+            return false;
+        }
+    }
+
+    for (int i = 0; i < 2; ++i) {
+        cudaError_t e = cudaEventCreateWithFlags(reinterpret_cast<cudaEvent_t*>(&events_[i]), cudaEventDisableTiming);
+        if (e != cudaSuccess) {
+            err = std::string("ExpertCache::BulkUploadSession: cudaEventCreateWithFlags failed: ") + cudaGetErrorString(e);
+            (void) finish(err);
+            return false;
+        }
+        event_recorded_[i] = false;
+    }
+
+    cudaError_t se = cudaStreamCreate(reinterpret_cast<cudaStream_t*>(&stream_));
+    if (se != cudaSuccess) {
+        err = std::string("ExpertCache::BulkUploadSession: cudaStreamCreate failed: ") + cudaGetErrorString(se);
+        (void) finish(err);
+        return false;
+    }
+
+    unsigned int n_threads = std::thread::hardware_concurrency();
+    if (n_threads == 0) n_threads = 4;
+    n_threads = std::min(n_threads, 4u);
+    if (n_threads > 1) {
+        pool_ = std::make_unique<WorkerPool>(n_threads - 1);
+    }
+
+    active_buf_ = 0;
+    initialized_ = true;
+    return true;
+}
+
+bool ExpertCache::BulkUploadSession::upload(const Item* items, size_t count, std::string& err) {
+    if (!initialized_) {
+        if (!init(err)) return false;
+    }
+    if (items == nullptr || count == 0) return true;
+
+    size_t idx = 0;
+    while (idx < count) {
+        size_t batch_start = idx;
+        size_t batch_bytes = 0;
+        std::vector<size_t> offsets;
+
+        while (idx < count) {
+            const auto& it = items[idx];
+            if (it.bytes > static_cast<int64_t>(kRingBufferSize)) {
+                if (batch_start == idx) {
+                    if (event_recorded_[active_buf_]) {
+                        strata_wddm_flush(static_cast<cudaStream_t>(stream_));
+                        cudaError_t ev_sync = cudaEventSynchronize(static_cast<cudaEvent_t>(events_[active_buf_]));
+                        if (ev_sync != cudaSuccess) {
+                            err = std::string("ExpertCache::BulkUploadSession: event sync failed: ") + cudaGetErrorString(ev_sync);
+                            return false;
+                        }
+                        event_recorded_[active_buf_] = false;
+                    }
+                    if (stream_) {
+                        strata_wddm_flush(static_cast<cudaStream_t>(stream_));
+                        cudaError_t s_sync = cudaStreamSynchronize(static_cast<cudaStream_t>(stream_));
+                        if (s_sync != cudaSuccess) {
+                            err = std::string("ExpertCache::BulkUploadSession: stream sync failed: ") + cudaGetErrorString(s_sync);
+                            return false;
+                        }
+                    }
+                    if (!cache_.fill_slot_blocking(it.slot, it.host_blob, err, it.bytes)) {
+                        return false;
+                    }
+                    idx++;
+                    batch_start = idx;
+                    continue;
+                } else {
+                    break;
+                }
+            }
+
+            if (batch_bytes + static_cast<size_t>(it.bytes) > kRingBufferSize) {
+                break;
+            }
+
+            offsets.push_back(batch_bytes);
+            batch_bytes += static_cast<size_t>(it.bytes);
+            idx++;
+        }
+
+        if (idx == batch_start) continue;
+
+        int p = active_buf_;
+        if (event_recorded_[p]) {
+            strata_wddm_flush(static_cast<cudaStream_t>(stream_));
+            cudaError_t e = cudaEventSynchronize(static_cast<cudaEvent_t>(events_[p]));
+            if (e != cudaSuccess) {
+                err = std::string("ExpertCache::BulkUploadSession: event sync failed: ") + cudaGetErrorString(e);
+                return false;
+            }
+            event_recorded_[p] = false;
+        }
+
+        size_t batch_count = idx - batch_start;
+        uint8_t* dst_buf = buf_[p];
+        std::vector<std::function<void()>> copy_tasks;
+        copy_tasks.reserve(batch_count);
+
+        for (size_t k = 0; k < batch_count; ++k) {
+            const Item* cur_item = &items[batch_start + k];
+            size_t off = offsets[k];
+            copy_tasks.emplace_back([dst_buf, off, cur_item] {
+                std::memcpy(dst_buf + off, cur_item->host_blob, static_cast<size_t>(cur_item->bytes));
+            });
+        }
+        if (pool_) {
+            pool_->run_tasks(copy_tasks);
+        } else {
+            for (auto& t : copy_tasks) t();
+        }
+
+        for (size_t k = 0; k < batch_count; ++k) {
+            const Item& it = items[batch_start + k];
+            uint8_t* dev_dst = cache_.device_slot(it.slot);
+            if (dev_dst == nullptr) {
+                err = "ExpertCache::BulkUploadSession: slot outside arena";
+                return false;
+            }
+            cudaError_t e = cudaMemcpyAsync(dev_dst, dst_buf + offsets[k], static_cast<size_t>(it.bytes),
+                                            cudaMemcpyHostToDevice, static_cast<cudaStream_t>(stream_));
+            if (e != cudaSuccess) {
+                err = std::string("ExpertCache::BulkUploadSession: cudaMemcpyAsync failed: ") + cudaGetErrorString(e);
+                return false;
+            }
+            cache_.increment_fills(1);
+        }
+
+        cudaError_t er = cudaEventRecord(static_cast<cudaEvent_t>(events_[p]), static_cast<cudaStream_t>(stream_));
+        if (er != cudaSuccess) {
+            err = std::string("ExpertCache::BulkUploadSession: cudaEventRecord failed: ") + cudaGetErrorString(er);
+            return false;
+        }
+        strata_wddm_flush(static_cast<cudaStream_t>(stream_));
+        event_recorded_[p] = true;
+        active_buf_ ^= 1;
+    }
+    return true;
+}
+
+bool ExpertCache::BulkUploadSession::finish(std::string& err) {
+    if (!initialized_) return true;
+
+    if (stream_) {
+        strata_wddm_flush(static_cast<cudaStream_t>(stream_));
+        cudaError_t e = cudaStreamSynchronize(static_cast<cudaStream_t>(stream_));
+        if (e != cudaSuccess && err.empty()) {
+            err = std::string("ExpertCache::BulkUploadSession: finish stream sync failed: ") + cudaGetErrorString(e);
+        }
+    }
+    cudaDeviceSynchronize();
+
+    pool_.reset();
+
+    for (int i = 0; i < 2; ++i) {
+        if (events_[i]) {
+            cudaEventDestroy(static_cast<cudaEvent_t>(events_[i]));
+            events_[i] = nullptr;
+        }
+        event_recorded_[i] = false;
+    }
+
+    if (stream_) {
+        cudaStreamDestroy(static_cast<cudaStream_t>(stream_));
+        stream_ = nullptr;
+    }
+
+    for (int i = 0; i < 2; ++i) {
+        if (buf_[i]) {
+            cudaFreeHost(buf_[i]);
+            buf_[i] = nullptr;
+        }
+    }
+
+    active_buf_ = 0;
+    initialized_ = false;
+    return err.empty();
 }
 
 }  // namespace strata::core

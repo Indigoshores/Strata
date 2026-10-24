@@ -6075,27 +6075,83 @@ int main(int argc, char** argv) {
         }
         const auto fill_t0 = std::chrono::steady_clock::now();
         uint64_t fill_bytes = 0;
-        for (int64_t i = 0; i < want; ++i) {
-            if (!per_layer && srcp == &src && src.unbuffered() && i % 64 == 0) {
-                if (ahead.valid()) ahead.get();
-                else read_batch(i);
-                if (i + 64 < want) ahead = std::async(std::launch::async, [&read_batch](int64_t b) { strata::aux_cpus::pin_current_thread(); read_batch(b); }, i + 64);
+        const bool fast_load = [] {
+            const char* v = std::getenv("STRATA_FAST_LOAD");
+            return v == nullptr || std::atoi(v) != 0;
+        }();
+        if (fast_load) {
+            strata::core::ExpertCache::BulkUploadSession bulk_session(xcache);
+            if (!bulk_session.init(err)) {
+                std::fprintf(stderr, "strata generate: BulkUploadSession init failed: %s; falling back to legacy loader\n", err.c_str());
+                goto legacy_fill;
             }
-            if (fill_ahead > 0 && i + fill_ahead < want) (void) src.advise_pairs(profile.data() + i + fill_ahead, 1);
-            const int32_t slot = xcache.admit(profile[(size_t) i].first, profile[(size_t) i].second);
-            if (slot == strata::core::kNotResident) {
-                if (per_layer) continue;
-                break;
+            constexpr int64_t kPrefetchWindow = 256;
+            bool cache_full = false;
+            for (int64_t w = 0; w < want && !cache_full; w += kPrefetchWindow) {
+                const int64_t w_end = std::min(w + kPrefetchWindow, want);
+                std::vector<std::pair<const void*, size_t>> ranges;
+                std::vector<strata::core::ExpertCache::BulkUploadSession::Item> items;
+                ranges.reserve(static_cast<size_t>(w_end - w));
+                items.reserve(static_cast<size_t>(w_end - w));
+
+                for (int64_t i = w; i < w_end; ++i) {
+                    const int32_t slot = xcache.admit(profile[(size_t) i].first, profile[(size_t) i].second);
+                    if (slot == strata::core::kNotResident) {
+                        if (per_layer) continue;
+                        cache_full = true;
+                        break;
+                    }
+                    const uint8_t* b = srcp->blob_stable(profile[(size_t) i].first, profile[(size_t) i].second);
+                    if (b == nullptr) {
+                        std::fprintf(stderr, "strata generate: the profile fill found null blob at pair %lld\n", (long long) i);
+                        return 1;
+                    }
+                    const int64_t sz = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first);
+                    ranges.emplace_back(b, static_cast<size_t>(sz));
+                    items.push_back({slot, b, sz});
+                    fill_bytes += sz;
+                    ++prefilled;
+                }
+
+                if (!ranges.empty()) {
+                    strata::platform::prefetch_ranges(ranges.data(), ranges.size());
+                }
+                if (!items.empty()) {
+                    if (!bulk_session.upload(items.data(), items.size(), err)) {
+                        std::fprintf(stderr, "strata generate: bulk upload failed at window [%lld, %lld): %s\n",
+                                     (long long) w, (long long) w_end, err.c_str());
+                        return 1;
+                    }
+                }
             }
-            const uint8_t* b = srcp->blob_stable(profile[(size_t) i].first, profile[(size_t) i].second);
-            if (b == nullptr || !xcache.fill_slot_blocking(slot, b, err,
-                    (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first))) {
-                std::fprintf(stderr, "strata generate: the profile fill failed at pair %lld: %s\n",
-                             (long long) i, err.c_str());
+            if (!bulk_session.finish(err)) {
+                std::fprintf(stderr, "strata generate: bulk upload session finish failed: %s\n", err.c_str());
                 return 1;
             }
-            fill_bytes += strata::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first);
-            ++prefilled;
+        } else {
+        legacy_fill:
+            for (int64_t i = 0; i < want; ++i) {
+                if (!per_layer && srcp == &src && src.unbuffered() && i % 64 == 0) {
+                    if (ahead.valid()) ahead.get();
+                    else read_batch(i);
+                    if (i + 64 < want) ahead = std::async(std::launch::async, [&read_batch](int64_t b) { strata::aux_cpus::pin_current_thread(); read_batch(b); }, i + 64);
+                }
+                if (fill_ahead > 0 && i + fill_ahead < want) (void) src.advise_pairs(profile.data() + i + fill_ahead, 1);
+                const int32_t slot = xcache.admit(profile[(size_t) i].first, profile[(size_t) i].second);
+                if (slot == strata::core::kNotResident) {
+                    if (per_layer) continue;
+                    break;
+                }
+                const uint8_t* b = srcp->blob_stable(profile[(size_t) i].first, profile[(size_t) i].second);
+                if (b == nullptr || !xcache.fill_slot_blocking(slot, b, err,
+                        (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first))) {
+                    std::fprintf(stderr, "strata generate: the profile fill failed at pair %lld: %s\n",
+                                 (long long) i, err.c_str());
+                    return 1;
+                }
+                fill_bytes += strata::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first);
+                ++prefilled;
+            }
         }
         const double fill_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - fill_t0).count();
         // **AND ONE SLOT IS READ BACK AND COMPARED.**  A residency table that is right about indices and wrong
@@ -7040,7 +7096,17 @@ int main(int argc, char** argv) {
         // ... and the ones a GPU holds are handed back first (STRATA_ARENA_RELEASE=0 keeps them): the fill read the
         // whole arena, and left mapped and referenced it crowds every other allocation into swap
         {
-            static const bool keep = std::getenv("STRATA_ARENA_RELEASE") && std::getenv("STRATA_ARENA_RELEASE")[0] == '0';
+            static const bool keep = [] {
+                const char* ar = std::getenv("STRATA_ARENA_RELEASE");
+                if (ar != nullptr) return ar[0] == '0';
+                const char* fr = std::getenv("STRATA_FILE_RELEASE");
+                if (fr != nullptr) return fr[0] == '0';
+#if defined(_WIN32)
+                return false;
+#else
+                return false;
+#endif
+            }();
             rss_probe("before the release");
             uint64_t released = 0;
             if (!keep)

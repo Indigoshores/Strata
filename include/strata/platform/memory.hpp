@@ -68,6 +68,10 @@ void advise_willneed(const void* p, uint64_t bytes);
 /// The same for [offset, offset + bytes) of an open file.
 void advise_willneed(int fd, uint64_t offset, uint64_t bytes);
 
+/// Batched prefetch for multiple address ranges. On Windows, batches up to 128 page-aligned
+/// WIN32_MEMORY_RANGE_ENTRY items per PrefetchVirtualMemory syscall.
+void prefetch_ranges(const std::pair<const void*, size_t>* ranges, size_t count);
+
 /// What the OS says this process read from storage: `read_bytes` (/proc/self/io: bytes fetched from the block layer on
 /// its behalf, page faults on a mapping included, page-cache hits not) and `major_faults` (/proc/self/stat).  Linux
 /// only; `valid` is false elsewhere.  Take one at the start of a request and one at its end.
