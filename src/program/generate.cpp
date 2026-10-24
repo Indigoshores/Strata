@@ -6085,39 +6085,51 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata generate: BulkUploadSession init failed: %s; falling back to legacy loader\n", err.c_str());
                 goto legacy_fill;
             }
+            // Sequential upload sort: admit all want pairs in profile frequency order first (slot 0 remains profile[0]),
+            // then sort by host_blob address ascending so the GGUF mmap reads sequentially without random backward seeks.
+            std::vector<strata::core::ExpertCache::BulkUploadSession::Item> all_items;
+            all_items.reserve(static_cast<size_t>(want));
+            for (int64_t i = 0; i < want; ++i) {
+                const int32_t slot = xcache.admit(profile[(size_t) i].first, profile[(size_t) i].second);
+                if (slot == strata::core::kNotResident) {
+                    if (per_layer) continue;
+                    break;
+                }
+                const uint8_t* b = srcp->blob_stable(profile[(size_t) i].first, profile[(size_t) i].second);
+                if (b == nullptr) {
+                    std::fprintf(stderr, "strata generate: the profile fill found null blob at pair %lld\n", (long long) i);
+                    return 1;
+                }
+                const int64_t sz = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first);
+                all_items.push_back({slot, b, sz});
+                fill_bytes += sz;
+                ++prefilled;
+            }
+
+            std::sort(all_items.begin(), all_items.end(),
+                      [](const strata::core::ExpertCache::BulkUploadSession::Item& a,
+                         const strata::core::ExpertCache::BulkUploadSession::Item& b) {
+                          return reinterpret_cast<uintptr_t>(a.host_blob) < reinterpret_cast<uintptr_t>(b.host_blob);
+                      });
+
             constexpr int64_t kPrefetchWindow = 256;
-            bool cache_full = false;
-            for (int64_t w = 0; w < want && !cache_full; w += kPrefetchWindow) {
-                const int64_t w_end = std::min(w + kPrefetchWindow, want);
+            const int64_t total_admitted = static_cast<int64_t>(all_items.size());
+            for (int64_t w = 0; w < total_admitted; w += kPrefetchWindow) {
+                const int64_t w_end = std::min(w + kPrefetchWindow, total_admitted);
+                const size_t batch_size = static_cast<size_t>(w_end - w);
                 std::vector<std::pair<const void*, size_t>> ranges;
-                std::vector<strata::core::ExpertCache::BulkUploadSession::Item> items;
-                ranges.reserve(static_cast<size_t>(w_end - w));
-                items.reserve(static_cast<size_t>(w_end - w));
+                ranges.reserve(batch_size);
 
                 for (int64_t i = w; i < w_end; ++i) {
-                    const int32_t slot = xcache.admit(profile[(size_t) i].first, profile[(size_t) i].second);
-                    if (slot == strata::core::kNotResident) {
-                        if (per_layer) continue;
-                        cache_full = true;
-                        break;
-                    }
-                    const uint8_t* b = srcp->blob_stable(profile[(size_t) i].first, profile[(size_t) i].second);
-                    if (b == nullptr) {
-                        std::fprintf(stderr, "strata generate: the profile fill found null blob at pair %lld\n", (long long) i);
-                        return 1;
-                    }
-                    const int64_t sz = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first);
-                    ranges.emplace_back(b, static_cast<size_t>(sz));
-                    items.push_back({slot, b, sz});
-                    fill_bytes += sz;
-                    ++prefilled;
+                    ranges.emplace_back(all_items[(size_t) i].host_blob,
+                                        static_cast<size_t>(all_items[(size_t) i].bytes));
                 }
 
                 if (!ranges.empty()) {
                     strata::platform::prefetch_ranges(ranges.data(), ranges.size());
                 }
-                if (!items.empty()) {
-                    if (!bulk_session.upload(items.data(), items.size(), err)) {
+                if (batch_size > 0) {
+                    if (!bulk_session.upload(&all_items[(size_t) w], batch_size, err)) {
                         std::fprintf(stderr, "strata generate: bulk upload failed at window [%lld, %lld): %s\n",
                                      (long long) w, (long long) w_end, err.c_str());
                         return 1;
@@ -8845,9 +8857,26 @@ int main(int argc, char** argv) {
         // #879: a window met non-finite logits: the next request drops every cached state first and reads from token 0
         bool nan_flush = false;
         std::vector<ConvCheckpoint> checks;
-        // STRATA_CKPT_POOL: the dropped checkpoints' storage, reused.  STRATA_SLOT_CKPT_MOVE turns it on too: a moved
-        // checkpoint frees nothing at the next prune, so every save would fault in fresh pages (17 -> 40-60 ms)
         CheckpointPool ckpt_pool(ckpt_pool_env() || slot_ckpt_move_env());
+        if (ckpt_pool.on() && o.prompt_cache > 0 && stages.empty()) {
+            strata::core::ConversationStateSizes z;
+            std::string err;
+            if (strata::core::conversation_session_sizes(g, ss, z, err)) {
+                const size_t layers = (size_t) std::max<int64_t>(ss.qsa_alloc, 0);
+                ConvCheckpoint pre;
+                pre.gdn.resize(z.gdn);
+                pre.ple.resize(ss.ple_hist ? z.ple : 0);
+                pre.tails.resize(layers * z.tail);
+                pre.dead.resize(layers * z.dead);
+                pre.block_pos.resize(layers * z.block_pos);
+                if (!pre.gdn.empty()) std::memset(pre.gdn.data(), 0, pre.gdn.size());
+                if (!pre.ple.empty()) std::memset(pre.ple.data(), 0, pre.ple.size());
+                if (!pre.tails.empty()) std::memset(pre.tails.data(), 0, pre.tails.size());
+                if (!pre.dead.empty()) std::memset(pre.dead.data(), 0, pre.dead.size());
+                if (!pre.block_pos.empty()) std::memset(pre.block_pos.data(), 0, pre.block_pos.size());
+                ckpt_pool.give(std::move(pre));
+            }
+        }
         uint64_t check_clock = 0;   // the checkpoints' LRU clock; creation and every use advance it
         int64_t tail_ckpt_len = -1;   // --prompt-cache-tail: the length of the one tail checkpoint alive (-1 = none)
         // --prefill-pipe: the plan of the prompt segment being read (read_part sets it around its runs), for the
@@ -13445,7 +13474,9 @@ int main(int argc, char** argv) {
             // and the serial loop with nothing else reading its windows
             int64_t merge_at = -1;
             auto merge_from = [&](int64_t a0, int64_t to) -> int64_t {
-                if (!admit_merge_first_env() || admit_slot < 0 || max_new != 1 || batch_mtp || pipe) return -1;
+                const bool ok_mode = (admit_slot >= 0 && max_new == 1) ||
+                                     (admit_slot < 0 && max_new >= 1 && o.batch == 0);
+                if (!admit_merge_first_env() || !ok_mode || batch_mtp || pipe) return -1;
                 if (to != n - 1 || to == turn_at || to == root_at || to == message_at || to == pin_at) return -1;
                 if (!req_imgs.empty() || kvg.on || peer.valid() || remote_caches || remote_opt || fs_swap) return -1;
                 if (std::getenv("STRATA_LOGPOS") != nullptr) return -1;
