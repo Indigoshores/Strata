@@ -1890,6 +1890,66 @@ __global__ void route_kernel(const float* __restrict__ logits, int32_t* __restri
     selected_sum = fmaxf(warp_sum(selected_sum), 6.103515625e-5f);
     if (lane < 10) wout[t * 10 + lane] = selected / selected_sum;
 }
+__global__ void router_tail_prune_kernel(int32_t* __restrict__ ids, float* __restrict__ w,
+                                         int64_t T, int64_t c0, int64_t n_total, float min_p) {
+    const int64_t t = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= T) return;
+    const int64_t pos = c0 + t;
+    if (n_total > 16 && pos < n_total - 16) {
+        const float w0 = w[t * 10 + 0];
+        const float thresh = (min_p < 0.0f) ? ((-min_p) * w0) : min_p;
+        float orig_sum = w0 + w[t * 10 + 1]; // top-2 (rank 0 & 1) are always preserved
+        float kept_sum = orig_sum;
+#pragma unroll
+        for (int k = 2; k < 10; ++k) {
+            const float wk = w[t * 10 + k];
+            orig_sum += wk;
+            if (wk < thresh) {
+                ids[t * 10 + k] = -1;
+                w[t * 10 + k] = 0.0f;
+            } else {
+                kept_sum += wk;
+            }
+        }
+        if (kept_sum > 0.0f && kept_sum < orig_sum) {
+            const float scale = orig_sum / fmaxf(kept_sum, 1e-12f);
+#pragma unroll
+            for (int k = 0; k < 10; ++k) {
+                if (ids[t * 10 + k] >= 0) {
+                    w[t * 10 + k] *= scale;
+                }
+            }
+        }
+    }
+}
+__global__ void moe_init_bo_kernel(float* __restrict__ bo, const float* __restrict__ shared,
+                                   const float* __restrict__ sg, int64_t T) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= T * (N / 4)) return;
+    const int64_t t = i / (N / 4);
+    if (shared && sg) {
+        const float g = sigm(sg[t]);
+        const float4 sh = reinterpret_cast<const float4*>(shared)[i];
+        reinterpret_cast<float4*>(bo)[i] = make_float4(sh.x * g, sh.y * g, sh.z * g, sh.w * g);
+    } else if (shared) {
+        reinterpret_cast<float4*>(bo)[i] = reinterpret_cast<const float4*>(shared)[i];
+    } else {
+        reinterpret_cast<float4*>(bo)[i] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+}
+__global__ void moe_add_shared_kernel(float* __restrict__ bo, const float* __restrict__ shared,
+                                      const float* __restrict__ sg, int64_t T) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= T * (N / 4)) return;
+    const int64_t t = i / (N / 4);
+    if (shared && sg) {
+        const float g = sigm(sg[t]);
+        const float4 sh = reinterpret_cast<const float4*>(shared)[i];
+        float4* b4 = reinterpret_cast<float4*>(bo);
+        const float4 b = b4[i];
+        b4[i] = make_float4(b.x + sh.x * g, b.y + sh.y * g, b.z + sh.z * g, b.w + sh.w * g);
+    }
+}
 // Strata blob: gate/up codes [1280][640 B], down codes [2560][160 B], gate/up scales [1280][40] f16, down scales [2560][10] f16
 template <bool HALF>
 __global__ void blob_dequant_kernel(const uint8_t* __restrict__ blob, uint16_t* __restrict__ gu16,
@@ -1948,9 +2008,11 @@ __global__ void moe_combine_kernel(const float* __restrict__ Dm, const int32_t* 
     float s = 0.0f;
 #pragma unroll
     for (int k = 0; k < 10; ++k) {
+        const float wk = w[t * 10 + k];
+        if (wk == 0.0f) continue;
         const int64_t r = slot[t * 10 + k];
         const float v = row_sd ? Dm[r * N + d] * row_sd[r] : Dm[r * N + d];   // the product scale_down_rows stored
-        s = fmaf(w[t * 10 + k], v, s);
+        s = fmaf(wk, v, s);
     }
     bo[i] = s + shared[i] * sigm(sg[t]);
 }
@@ -1970,6 +2032,10 @@ __global__ void moe_combine4_kernel(const float* __restrict__ Dm, const int32_t*
 #pragma unroll
     for (int k = 0; k < 10; ++k) {
         ww[k] = w[t * 10 + k];
+        if (ww[k] == 0.0f) {
+            v[k] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            continue;
+        }
         const int64_t r = slot[t * 10 + k];
         v[k] = *reinterpret_cast<const float4*>(Dm + r * N + d);
         if (row_sd) {   // NVFP4 in MMQ: the row's s_down, as moe_combine_kernel applies it
@@ -2569,6 +2635,21 @@ void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t
     else
         strata::kernels::router_top10(logits, (int) T, (int) n_expert, 10, ids, weights, stream);
     check("route");
+}
+void router_tail_prune(int32_t* ids, float* w, int64_t T, int64_t c0, int64_t n_total, float min_p, void* stream) {
+    if (T <= 0 || min_p == 0.0f) return;
+    router_tail_prune_kernel<<<blocks_for(T), 256, 0, (cudaStream_t) stream>>>(ids, w, T, c0, n_total, min_p);
+    check("router_tail_prune");
+}
+void moe_init_bo(float* bo, const float* shared, const float* sg, int64_t T, void* stream) {
+    if (T <= 0) return;
+    moe_init_bo_kernel<<<blocks_for(T * (N / 4)), 256, 0, (cudaStream_t) stream>>>(bo, shared, sg, T);
+    check("moe_init_bo");
+}
+void moe_add_shared(float* bo, const float* shared, const float* sg, int64_t T, void* stream) {
+    if (T <= 0 || !shared || !sg) return;
+    moe_add_shared_kernel<<<blocks_for(T * (N / 4)), 256, 0, (cudaStream_t) stream>>>(bo, shared, sg, T);
+    check("moe_add_shared");
 }
 void blob_dequant(const uint8_t* blob, uint16_t* gu16, uint16_t* down16, void* stream) {
     blob_dequant_kernel<false><<<blocks_for(1280LL * 640 + 2560LL * 160), 256, 0, (cudaStream_t) stream>>>(blob, gu16, down16);

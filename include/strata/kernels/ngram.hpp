@@ -22,8 +22,11 @@
 // All of those are asserted observable in `ple_parity.cpp` rather than trusted.
 #pragma once
 
+#include "strata/spec/draft_source.hpp"
+
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace strata::kernels {
 
@@ -248,5 +251,62 @@ bool ple_prefetch_enabled();
 // comment claiming MADV_RANDOM here would be a comment about code that does not run.  On Linux the advice
 // belongs in `GgufFile::open`, which this module does not own.
 // ------------------------------------------------------------------------------------------------------
+
+// ==================== DYNAMIC <THINK> REASONING OUTPUT N-GRAM CACHE ====================
+//
+// Dynamically indexes generated tokens (including <think> reasoning output) into a bounded
+// host-side circular buffer with 3-gram and recency-prioritized 2-gram tables.
+// When 3-gram matching finds no continuation, falls back to 2-gram empirical agreement
+// within a configurable recency window. Zero persistent GPU VRAM; peak host commit < 2 MiB.
+class ThinkNgramCache : public strata::spec::DraftSource {
+public:
+    explicit ThinkNgramCache(size_t capacity_tokens = 8192);
+    ~ThinkNgramCache() override = default;
+
+    const char* name() const override { return "think-ngram"; }
+    void reset() override;
+    void append(const int32_t* tokens, size_t n) override;
+    void append(int32_t token) { append(&token, 1); }
+
+    int propose(const int32_t* tail, int n_tail, int n_pending, int max_k, int32_t* out, int* match) override;
+    int propose(int max_k, int32_t* out, int* match = nullptr);
+    int propose_from_context(const int32_t* ctx, int ctx_len, int max_k, int32_t* out, int* match = nullptr);
+
+    int last_match() const { return last_match_; }
+    size_t size() const { return count_; }
+    bool enabled() const { return enabled_; }
+
+private:
+    struct Slot3 {
+        uint64_t key = 0;
+        uint32_t pos[4] = {};
+        uint8_t n = 0;
+    };
+
+    struct Slot2 {
+        uint64_t key = 0;
+        uint32_t pos[8] = {};
+        uint8_t n = 0;
+    };
+
+    void record_at(size_t end_idx);
+    static uint64_t hash3(int32_t a, int32_t b, int32_t c);
+    static uint64_t hash2(int32_t a, int32_t b);
+
+    size_t capacity_ = 8192;
+    std::vector<int32_t> ring_;
+    size_t count_ = 0;
+    size_t total_appended_ = 0;
+
+    std::vector<Slot3> table3_;
+    size_t mask3_ = 0;
+    std::vector<Slot2> table2_;
+    size_t mask2_ = 0;
+
+    bool enabled_ = true;
+    size_t window_2gram_ = 2048;
+    bool strict_2gram_ = true;
+    int last_match_ = 0;
+};
 
 }  // namespace strata::kernels

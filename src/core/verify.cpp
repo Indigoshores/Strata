@@ -169,7 +169,7 @@ inline bool g_qfuse_hc() {
         int dev = 0;
         cudaDeviceProp p;
         return cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&p, dev) == cudaSuccess &&
-               strata::kernels::gfx_arch_is_gfx12(p.gcnArchName);
+               (strata::kernels::gfx_arch_is_gfx12(p.gcnArchName) || strata::kernels::gfx_arch_is_gfx1151(p.gcnArchName));
     }();
     return on;
 #else
@@ -200,7 +200,18 @@ bool env_on(const char* name) {
     return e != nullptr && e[0] != 0 && e[0] != '0';
 }
 #if defined(STRATA_USE_HIP)
-const bool g_coherent = env_on("STRATA_VERIFY_COHERENT");
+inline bool verify_coherent_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_VERIFY_COHERENT");
+        if (v != nullptr) return std::atoi(v) != 0;
+        int dev = 0;
+        cudaDeviceProp p;
+        return cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&p, dev) == cudaSuccess &&
+               strata::kernels::gfx_arch_is_gfx1151(p.gcnArchName);
+    }();
+    return on;
+}
+const bool g_coherent = verify_coherent_on();
 const bool g_doorbell_store = env_on("STRATA_DOORBELL_STORE");
 #endif
 const bool g_trace = env_on("STRATA_VERIFY_TRACE");
@@ -303,7 +314,8 @@ bool fuse_wait_on() {
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
     if (!per_dev[dev]) {
         cudaDeviceProp p;
-        per_dev[dev] = cudaGetDeviceProperties(&p, dev) == cudaSuccess && strata::kernels::gfx_arch_is_gfx12(p.gcnArchName) ? 2 : 1;
+        per_dev[dev] = cudaGetDeviceProperties(&p, dev) == cudaSuccess &&
+                       (strata::kernels::gfx_arch_is_gfx12(p.gcnArchName) || strata::kernels::gfx_arch_is_gfx1151(p.gcnArchName)) ? 2 : 1;
     }
     return per_dev[dev] == 2;
 #else
@@ -345,7 +357,8 @@ bool fuse_hits_on() {
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
     if (!per_dev[dev]) {
         cudaDeviceProp p;
-        per_dev[dev] = cudaGetDeviceProperties(&p, dev) == cudaSuccess && strata::kernels::gfx_arch_is_gfx12(p.gcnArchName) ? 2 : 1;
+        per_dev[dev] = cudaGetDeviceProperties(&p, dev) == cudaSuccess &&
+                       (strata::kernels::gfx_arch_is_gfx12(p.gcnArchName) || strata::kernels::gfx_arch_is_gfx1151(p.gcnArchName)) ? 2 : 1;
     }
     return per_dev[dev] == 2;
 #else
@@ -607,7 +620,8 @@ Verifier::~Verifier() {
     if (arena_) cudaFree(arena_);
     if (hcount_d_) cudaFree(hcount_d_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
-                     h_flagA_, h_plan_, h_flagB_, h_plan_err_, h_nf_, herr_h_, hdrop_h_, h_bal_};
+                     h_flagA_, h_plan_, h_flagB_, h_plan_err_, h_nf_, herr_h_, hdrop_h_, h_bal_,
+                     h_tree_pos_, h_tree_parent_, h_tree_mask_};
     for (void* h : hosts)
         if (h) cudaFreeHost(h);
 }
@@ -719,7 +733,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
               mapped(64, (void**) &h_flagA_, (void**) &m_flagA_) &&
               mapped(64, (void**) &h_flagB_, (void**) &m_flagB_) &&
               mapped(64, (void**) &h_plan_err_, (void**) &m_plan_err_) &&
-              mapped(T * K * N * 4, (void**) &h_ymiss_, (void**) &m_ymiss_);
+              mapped(T * K * N * 4, (void**) &h_ymiss_, (void**) &m_ymiss_) &&
+              mapped(strata::kernels::kVerifyMaxT * sizeof(int32_t), (void**) &h_tree_pos_, (void**) &m_tree_pos_) &&
+              mapped(strata::kernels::kVerifyMaxT * sizeof(int32_t), (void**) &h_tree_parent_, (void**) &m_tree_parent_) &&
+              mapped(strata::kernels::kVerifyMaxT * sizeof(uint32_t), (void**) &h_tree_mask_, (void**) &m_tree_mask_);
     if (!ok) { err = "verify: mapped staging allocation failed"; return false; }
     if (bal_ != nullptr) {   // set_pcie_balance: four stamp words per (layer, group)
         if (!mapped((size_t) g.n_layers * 2 * 4 * 8, (void**) &h_bal_, (void**) &m_bal_)) {
@@ -1414,6 +1431,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                             (const float*) wnm->data, EPS, y_ + (size_t) first * ZV,
                                             (int) HK, (int) HV, t - first, keep_rows ? one_ : nullptr, cs, 0);
                     }
+                } else
+                if (tree_active_ && tree_n_ > 0) {
+                    strata::kernels::gdn_step_norm_tree(state, hb, (int) C, gate, beta, z_, (const float*) wnm->data, EPS,
+                                                        y_, (int) HK, (int) HV, te, m_tree_parent_, cs, tb,
+                                                        g_qfuse() ? (void*) xq_ : nullptr);
                 } else
                 gdn_step_norm_multi(state, hb, (int) C, gate, beta, z_, (const float*) wnm->data, EPS, y_, (int) HK,
                                     (int) HV, te, self_commit ? one_ : nullptr, cs, tb, g_qfuse() ? (void*) xq_ : nullptr);
@@ -2514,8 +2536,9 @@ void Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0) {
     int32_t* const pi = pk + (size_t) max_t_ * g.n_head_kv;
     for (int t = 0; t < T; ++t) {
         h_tok_[t] = tokens[t];
-        qsa_step_fill(h_step_ + t * kStepCount, pos0 + t, s);
-        const int32_t pos_t = (int32_t) (pos0 + t);
+        const int64_t eff_pos = (tree_active_ && t < tree_n_) ? (pos0 + h_tree_pos_[t]) : (pos0 + t);
+        qsa_step_fill(h_step_ + t * kStepCount, eff_pos, s);
+        const int32_t pos_t = (int32_t) eff_pos;
         for (int64_t h = 0; h < g.n_head; ++h) h_pos_[t * g.n_head + h] = pos_t;
         for (int64_t h = 0; h < g.n_head_kv; ++h) pk[t * g.n_head_kv + h] = pos_t;
         for (int64_t h = 0; h < g.idx_q_heads; ++h) pi[t * g.idx_q_heads + h] = pos_t;
@@ -3200,6 +3223,117 @@ bool Verifier::commit(int n_keep, std::string& err) {
         }
     ms_commit += ms_since(t0);
     return next_ == nullptr || next_->commit(n_keep, err);
+}
+
+void Verifier::set_tree_window(const int32_t* pos_offsets, const int32_t* parent_slot, const uint32_t* attn_mask, int n_tokens) {
+    tree_active_ = true;
+    tree_n_ = n_tokens;
+    if (pos_offsets && h_tree_pos_) {
+        std::memcpy(h_tree_pos_, pos_offsets, (size_t) n_tokens * sizeof(int32_t));
+    }
+    if (parent_slot && h_tree_parent_) {
+        std::memcpy(h_tree_parent_, parent_slot, (size_t) n_tokens * sizeof(int32_t));
+    }
+    if (attn_mask && h_tree_mask_) {
+        std::memcpy(h_tree_mask_, attn_mask, (size_t) n_tokens * sizeof(uint32_t));
+    }
+    if (next_) next_->set_tree_window(pos_offsets, parent_slot, attn_mask, n_tokens);
+}
+
+void Verifier::clear_tree_window() {
+    tree_active_ = false;
+    tree_n_ = 0;
+    if (next_) next_->clear_tree_window();
+}
+
+bool Verifier::commit_slots(const int32_t* accepted_slots, int n_keep, std::string& err) {
+#if defined(STRATA_GPU_METAL)
+    return commit(n_keep, err);
+#endif
+    if (n_keep < 1 || n_keep > last_t_) { err = "verify: tree commit count out of range"; return false; }
+    if (!accepted_slots) { return commit(n_keep, err); }
+
+    bool is_linear = true;
+    for (int j = 0; j < n_keep; ++j) {
+        if (accepted_slots[j] != j) {
+            is_linear = false;
+            break;
+        }
+    }
+    if (is_linear) {
+        const bool ok = commit(n_keep, err);
+        clear_tree_window();
+        return ok;
+    }
+
+    const OnDevice on_device(device_);
+    const Clock::time_point t0 = Clock::now();
+    const ModelGeometry& g = *g_;
+    const int64_t C = g.ssm_conv_channels, HV = g.ssm_v_heads, ID = g.idx_key_dim;
+
+    int64_t qsa_index = 0, gdn_index = 0;
+    for (int64_t l = 0; l < lb_; ++l) (is_qsa_layer(g, l) ? qsa_index : gdn_index) += 1;
+    int64_t n_gdn = 0, n_qsa = 0;
+    for (int64_t l = lb_; l < le_; ++l) {
+        if (is_qsa_layer(g, l)) ++n_qsa;
+        else ++n_gdn;
+    }
+
+    if (h_tree_pos_) {
+        std::memcpy(h_tree_pos_, accepted_slots, (size_t) n_keep * sizeof(int32_t));
+    }
+
+    if (n_gdn > 0) {
+        strata::kernels::compact_tree_gdn_layers(
+            qkv_L_ + (size_t) gdn_index * max_t_ * C,
+            h_L_ + (size_t) gdn_index * max_t_ * C,
+            gate_L_ + (size_t) gdn_index * max_t_ * HV,
+            beta_L_ + (size_t) gdn_index * max_t_ * HV,
+            (int) C, (int) HV, max_t_, (int) n_gdn,
+            m_tree_pos_, n_keep, cs_);
+    }
+
+    if (n_qsa > 0) {
+        strata::kernels::compact_tree_qsa_indexer(
+            idx_raw_L_ + (size_t) qsa_index * max_t_ * ID,
+            (int) ID, max_t_, (int) n_qsa,
+            m_tree_pos_, n_keep, cs_);
+    }
+
+    h_commit_[0] = n_keep;
+    h_commit_[1] = n_keep - 1;
+    for (int t = 0; t < max_t_; ++t) h_commit_[2 + t] = t < n_keep ? (int32_t) (last_pos0_ + t) : -1;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+
+    if (!commit_exec_) {
+        if (!capture_commit(err)) return false;
+    }
+
+    const cudaError_t le = cudaGraphLaunch(commit_exec_, cs_);
+    if (le != cudaSuccess) { err = std::string("verify: tree commit launch: ") + cudaGetErrorString(le); return false; }
+    if (!g_commit_async || next_ != nullptr) {
+        const cudaError_t se = cudaStreamSynchronize(cs_);
+        if (se != cudaSuccess) { err = std::string("verify: tree commit: ") + cudaGetErrorString(se); return false; }
+    } else {
+        const cudaError_t re = cudaEventRecord(commit_done_, cs_);
+        if (re != cudaSuccess) { err = std::string("verify: tree commit event: ") + cudaGetErrorString(re); return false; }
+        (void) cudaStreamQuery(cs_);
+        commit_pending_ = true;
+    }
+
+    if (ple_stage()) {
+        for (int t = 0; t < n_keep; ++t) {
+            ss_->ple_prev[0] = ss_->ple_prev[1];
+            ss_->ple_prev[1] = last_tokens_[accepted_slots[t]];
+        }
+    }
+    for (int t = 0; t < n_keep; ++t) {
+        last_tokens_[t] = last_tokens_[accepted_slots[t]];
+    }
+
+    clear_tree_window();
+    ms_commit += ms_since(t0);
+    return next_ == nullptr || next_->commit_slots(accepted_slots, n_keep, err);
 }
 
 bool Verifier::wait_commit(std::string& err) {

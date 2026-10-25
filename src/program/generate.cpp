@@ -5206,7 +5206,7 @@ int main(int argc, char** argv) {
         const strata::core::OnDevice on_mtp(last_st && !mtp_first ? last_st->dev : -1);
         // --pipeline-windows 2: 8 rows (the chain runs on past the window in flight: its drafts, its bonus token and
         // the next window's drafts), and the round/step graphs carry the forcing kernel
-        const int mtp_t = o.pipeline_windows >= 2 ? strata::kernels::kVerifyMaxT : o.spec;
+        const int mtp_t = (o.pipeline_windows >= 2 || strata::core::MtpDrafter::mtp_tree_enabled()) ? strata::kernels::kVerifyMaxT : o.spec;
         if (o.pipeline_windows >= 2) mtp.set_force_capture(true);
         if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, last_st && !mtp_first ? last_st->ss : ss, mtp_t, err, o.mtp_window)) { std::fprintf(stderr, "strata generate: %s%s\n", err.c_str(), vram_free_note().c_str()); return 1; }
         mtp.set_ple_session(&ss);
@@ -5882,6 +5882,19 @@ int main(int argc, char** argv) {
             used += b;
             sized_slots.push_back((int64_t) lay.blob_bytes(pr.first));
         }
+        const char* fl_env = std::getenv("STRATA_FAST_LOAD");
+        const bool fl_want = (fl_env == nullptr || std::atoi(fl_env) != 0);
+        if (fl_want && !o.expert_cache_per_layer && sized_slots.size() == profile.size() &&
+            !sized_slots.empty() && used + (1ULL << 30) <= cap) {
+            std::sort(profile.begin(), profile.end(), [](const auto& a, const auto& b) {
+                if (a.first != b.first) return a.first < b.first;
+                return a.second < b.second;
+            });
+            sized_slots.clear();
+            for (const auto& pr : profile) {
+                sized_slots.push_back((int64_t) lay.blob_bytes(pr.first));
+            }
+        }
         // #831: the sized-slots loop walks the profile's pairs, so the profile's length is the ceiling; an explicit
         // --expert-cache above it used to be cut with no word.  A warning only (what is allocated does not change).
         if (!auto_cache && o.expert_cache > 0 && sized_slots.size() == profile.size() && (size_t) o.expert_cache > profile.size())
@@ -6064,9 +6077,13 @@ int main(int argc, char** argv) {
         // #286: an unbuffered file tier reads the pairs in batches of 64, the next batch while this one is copied
         std::future<void> ahead;
         auto read_batch = [&](int64_t at) { src.prefetch_pairs(profile.data() + at, std::min<int64_t>(64, want - at)); };
+        const bool fast_load = [] {
+            const char* v = std::getenv("STRATA_FAST_LOAD");
+            return v == nullptr || std::atoi(v) != 0;
+        }();
         // mapped reads: advise the next `fill_ahead` pairs so their reads overlap; STRATA_FILL_AHEAD=0 turns it off
         int64_t fill_ahead = 0;
-        if (!per_layer && srcp == &src && !src.unbuffered()) {
+        if (!fast_load && !per_layer && srcp == &src && !src.unbuffered()) {
             const char* v = std::getenv("STRATA_FILL_AHEAD");
             fill_ahead = v == nullptr ? 256 : std::max(0, std::atoi(v));
             if (fill_ahead > 0 && !src.advise_pairs(profile.data(), std::min<int64_t>(fill_ahead, want))) fill_ahead = 0;
@@ -6075,70 +6092,118 @@ int main(int argc, char** argv) {
         }
         const auto fill_t0 = std::chrono::steady_clock::now();
         uint64_t fill_bytes = 0;
-        const bool fast_load = [] {
-            const char* v = std::getenv("STRATA_FAST_LOAD");
-            return v == nullptr || std::atoi(v) != 0;
-        }();
         if (fast_load) {
             strata::core::ExpertCache::BulkUploadSession bulk_session(xcache);
             if (!bulk_session.init(err)) {
                 std::fprintf(stderr, "strata generate: BulkUploadSession init failed: %s; falling back to legacy loader\n", err.c_str());
                 goto legacy_fill;
             }
-            // Sequential upload sort: admit all want pairs in profile frequency order first (slot 0 remains profile[0]),
-            // then sort by host_blob address ascending so the GGUF mmap reads sequentially without random backward seeks.
-            std::vector<strata::core::ExpertCache::BulkUploadSession::Item> all_items;
-            all_items.reserve(static_cast<size_t>(want));
+            const int64_t prefetch_window = [] {
+                int64_t w = 192;
+                const char* env = std::getenv("STRATA_PREFETCH_WINDOW");
+                if (env && *env) {
+                    char* end = nullptr;
+                    long long val = std::strtoll(env, &end, 10);
+                    if (end != env && val > 0) {
+                        w = static_cast<int64_t>(val);
+                    }
+                }
+                if (w < 8) w = 8;
+                if (w > 512) w = 512;
+                return w;
+            }();
+            const bool file_release = [] {
+                const char* v = std::getenv("STRATA_FILE_RELEASE");
+                return v == nullptr || std::atoi(v) != 0;
+            }();
+
+            struct PendingItem {
+                int32_t slot;
+                int32_t layer;
+                int32_t expert;
+                int64_t profile_idx;
+            };
+            std::vector<PendingItem> pending;
+            pending.reserve(static_cast<size_t>(want));
             for (int64_t i = 0; i < want; ++i) {
-                const int32_t slot = xcache.admit(profile[(size_t) i].first, profile[(size_t) i].second);
+                const int32_t layer = profile[(size_t) i].first;
+                const int32_t expert = profile[(size_t) i].second;
+                const int32_t slot = xcache.admit(layer, expert);
                 if (slot == strata::core::kNotResident) {
                     if (per_layer) continue;
                     break;
                 }
-                const uint8_t* b = srcp->blob_stable(profile[(size_t) i].first, profile[(size_t) i].second);
-                if (b == nullptr) {
-                    std::fprintf(stderr, "strata generate: the profile fill found null blob at pair %lld\n", (long long) i);
-                    return 1;
-                }
-                const int64_t sz = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first);
-                all_items.push_back({slot, b, sz});
-                fill_bytes += sz;
-                ++prefilled;
+                pending.push_back({slot, layer, expert, i});
             }
 
-            std::sort(all_items.begin(), all_items.end(),
-                      [](const strata::core::ExpertCache::BulkUploadSession::Item& a,
-                         const strata::core::ExpertCache::BulkUploadSession::Item& b) {
-                          return reinterpret_cast<uintptr_t>(a.host_blob) < reinterpret_cast<uintptr_t>(b.host_blob);
-                      });
+            // Sort pending items monotonically by (layer, expert) for 100% sequential NVMe sweeps
+            std::sort(pending.begin(), pending.end(), [](const PendingItem& a, const PendingItem& b) {
+                if (a.layer != b.layer) return a.layer < b.layer;
+                return a.expert < b.expert;
+            });
 
-            constexpr int64_t kPrefetchWindow = 256;
-            const int64_t total_admitted = static_cast<int64_t>(all_items.size());
-            for (int64_t w = 0; w < total_admitted; w += kPrefetchWindow) {
-                const int64_t w_end = std::min(w + kPrefetchWindow, total_admitted);
-                const size_t batch_size = static_cast<size_t>(w_end - w);
-                std::vector<std::pair<const void*, size_t>> ranges;
-                ranges.reserve(batch_size);
+            std::vector<std::pair<int32_t, int32_t>> sorted_pairs;
+            sorted_pairs.reserve(pending.size());
+            for (const auto& pi : pending) {
+                sorted_pairs.emplace_back(pi.layer, pi.expert);
+            }
+
+            const int64_t total_pending = static_cast<int64_t>(pending.size());
+            std::future<void> pf_ahead;
+            if (srcp == &src && total_pending > 0) {
+                (void) src.advise_pairs(sorted_pairs.data(),
+                                        std::min<size_t>(sorted_pairs.size(), static_cast<size_t>(prefetch_window)));
+            }
+
+            for (int64_t w = 0; w < total_pending; w += prefetch_window) {
+                const int64_t w_end = std::min(w + prefetch_window, total_pending);
+                if (pf_ahead.valid()) pf_ahead.get();
+                const int64_t next_advise_start = w + prefetch_window;
+                if (srcp == &src && next_advise_start < total_pending) {
+                    const int64_t next_advise_count = std::min<int64_t>(prefetch_window, total_pending - next_advise_start);
+                    pf_ahead = std::async(std::launch::async, [&src, &sorted_pairs, next_advise_start, next_advise_count] {
+                        (void) src.advise_pairs(sorted_pairs.data() + next_advise_start, next_advise_count);
+                    });
+                }
+
+                std::vector<strata::core::ExpertCache::BulkUploadSession::Item> items;
+                items.reserve(static_cast<size_t>(w_end - w));
 
                 for (int64_t i = w; i < w_end; ++i) {
-                    ranges.emplace_back(all_items[(size_t) i].host_blob,
-                                        static_cast<size_t>(all_items[(size_t) i].bytes));
+                    const auto& pi = pending[(size_t) i];
+                    const int64_t sz = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(pi.layer);
+                    items.push_back({pi.slot, nullptr, sz, srcp, pi.layer, pi.expert});
+                    fill_bytes += sz;
+                    ++prefilled;
                 }
 
-                if (!ranges.empty()) {
-                    strata::platform::prefetch_ranges(ranges.data(), ranges.size());
-                }
-                if (batch_size > 0) {
-                    if (!bulk_session.upload(&all_items[(size_t) w], batch_size, err)) {
+                if (!items.empty()) {
+                    if (!bulk_session.upload(items.data(), items.size(), err)) {
+                        if (pf_ahead.valid()) pf_ahead.get();
                         std::fprintf(stderr, "strata generate: bulk upload failed at window [%lld, %lld): %s\n",
                                      (long long) w, (long long) w_end, err.c_str());
                         return 1;
                     }
                 }
+
+                if (file_release && srcp != nullptr && w >= prefetch_window) {
+                    for (int64_t i = w - prefetch_window; i < w; ++i) {
+                        const auto& pi = pending[(size_t) i];
+                        (void) srcp->release(pi.layer, pi.expert);
+                    }
+                }
             }
+            if (pf_ahead.valid()) pf_ahead.get();
             if (!bulk_session.finish(err)) {
                 std::fprintf(stderr, "strata generate: bulk upload session finish failed: %s\n", err.c_str());
                 return 1;
+            }
+            if (file_release && srcp != nullptr && total_pending > 0) {
+                const int64_t last_w = ((total_pending - 1) / prefetch_window) * prefetch_window;
+                for (int64_t i = last_w; i < total_pending; ++i) {
+                    const auto& pi = pending[(size_t) i];
+                    (void) srcp->release(pi.layer, pi.expert);
+                }
             }
         } else {
         legacy_fill:
@@ -8667,7 +8732,7 @@ int main(int argc, char** argv) {
         if (pcie_balance() && n_stages == 1) ver.set_pcie_balance(&drive.d.pcie_model);
         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
         if (!ver.init(wt, g, ss, vh, native_head.loaded() || prefill_head_alias_bound ? &native_head : nullptr,
-                      batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, std::min(o.batch, (int) strata::kernels::kVerifyMaxT)), err) ||
+                      (batch_mtp || strata::core::MtpDrafter::mtp_tree_enabled()) ? strata::kernels::kVerifyMaxT : std::max(o.spec, std::min(o.batch, (int) strata::kernels::kVerifyMaxT)), err) ||
             (use_mtp && !prefill_head_alias_bound && !mtp.bind(last_st && !mtp_first ? last_st->wt : wt, last_st ? &last_st->head : &native_head,
                                   pipe ? pl_mtp_R : ver.final_R_all(), err))) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
@@ -10655,12 +10720,15 @@ int main(int argc, char** argv) {
         std::fflush(stdout);
         std::string line;
         int64_t rounds = 0;
-        const int S = o.spec;
+        const int S = strata::core::MtpDrafter::mtp_tree_enabled() ? strata::kernels::kVerifyMaxT : o.spec;
         const int S_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, S) : S;   // the MTP's windows; suffixes go up to S
-        if (use_mtp && S_mtp < S) mtp.set_max_drafts(S_mtp - 1);
-        // --pipeline-windows 2 loads the drafter with 8 rows: the serial loop's chain keeps its own length
-        else if (use_mtp && mtp.max_t() > S_mtp) mtp.set_max_drafts(S_mtp - 1);
+        if (!strata::core::MtpDrafter::mtp_tree_enabled()) {
+            if (use_mtp && S_mtp < S) mtp.set_max_drafts(S_mtp - 1);
+            // --pipeline-windows 2 loads the drafter with 8 rows: the serial loop's chain keeps its own length
+            else if (use_mtp && mtp.max_t() > S_mtp) mtp.set_max_drafts(S_mtp - 1);
+        }
         strata::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
+        strata::kernels::ThinkNgramCache think_ngram;
         strata::spec::DraftPolicy policy(S);   // MTP or lookup window, learned over the whole process
         // The vision path (--vision): GENI <max_new> <embeddings file> <id,id,...> carries images.  The file is one
         // or more strata-vision records (int32 'SVE1', n, nx, ny, n_embd, then n x n_embd floats) in prompt order;
@@ -13600,10 +13668,16 @@ int main(int argc, char** argv) {
             std::vector<int32_t> drafts(DS, 0), window(WS), outv(WS);
             std::vector<float> dprob(DS, 0.0f);
             std::vector<int32_t> sbuf((size_t) S, 0);
+            strata::core::TreeDraft td_tree;
+            bool tree_draft_ready = false;
             const bool sfx_on = o.suffix_draft > 0 || o.lookup_chain > 0;
             if (sfx_on) {
                 sfx.reset();
                 for (int64_t t : ids) sfx.append((int32_t) t);
+            }
+            if (think_ngram.enabled()) {
+                think_ngram.reset();
+                for (int64_t t : ids) think_ngram.append((int32_t) t);
             }
             if (o.lookup_chain > 0) {
                 extra_sources_reset();
@@ -13892,9 +13966,12 @@ int main(int argc, char** argv) {
                     return v ? (float) std::atof(v) : 0.75f;
                 }();
                 auto pick_lookup = [&](PW& w, const int32_t* chain0) {
-                    if (o.suffix_draft <= 0 || w.seq == 0) return;
-                    const int k = sfx.propose(2 * S - 1, pl_sbuf.data());
-                    const int match = sfx.last_match();
+                    if ((o.suffix_draft <= 0 && !think_ngram.enabled()) || w.seq == 0) return;
+                    int k = o.suffix_draft > 0 ? sfx.propose(2 * S - 1, pl_sbuf.data()) : 0;
+                    int match = (k > 0) ? sfx.last_match() : 0;
+                    if (k <= 0 && think_ngram.enabled()) {
+                        k = think_ngram.propose(2 * S - 1, pl_sbuf.data(), &match);
+                    }
                     if (k <= 0 || pl_sbuf[0] != chain0[0]) return;
                     const strata::spec::DraftPolicy::Pick pk = policy.choose(w.T, std::min(k, S - 1), match);
                     if (!pk.lookup) return;
@@ -14165,6 +14242,7 @@ int main(int argc, char** argv) {
                         strata::core::progress_beat();
                         ++produced_n;
                         if (o.suffix_draft > 0) sfx.append(outp[(size_t) i]);
+                        if (think_ngram.enabled()) think_ngram.append(outp[(size_t) i]);
                         eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outp[(size_t) i]) != o.eos_ids.end();
                     }
                     std::fflush(stdout);
@@ -14306,51 +14384,69 @@ int main(int argc, char** argv) {
                 }
             }
             while (!pl_ran && !cancelled && produced_n < max_new) {
-                int T = use_mtp ? S_mtp : 1;   // no --mtp: one token a round unless a lookup draft fires
-                if (use_mtp && req_spec_min_p > 0.0) {
-                    T = 1;
-                    while (T < S_mtp && dprob[(size_t) T - 1] >= (float) req_spec_min_p) ++T;
-                }
-                if (first_window) T = merge_T > 0 ? merge_T : 1;
-                const bool merged = first_window && merge_T > 0;   // the prompt's last tokens and the first token
-                // a repeat of earlier context (prompt lookup) where the MTP's own first guess agrees: the policy takes it
-                // when its expected tokens per ms, from the measured acceptance and window costs, beat the MTP window's
+                const bool can_tree = use_mtp && strata::core::MtpDrafter::mtp_tree_enabled() &&
+                                      !first_window && tree_draft_ready &&
+                                      td_tree.branch_start > 0 && td_tree.total_tokens > td_tree.branch_start;
+                int T = 1;
+                int T_mtp = 1;
+                int chain_n = 0, cm = 0;
                 bool from_sfx = false;
                 int sfx_match = 0;
-                if (o.suffix_draft > 0 && !first_window) {
-                    const int k = sfx.propose(S - 1, sbuf.data());
-                    sfx_match = sfx.last_match();
-                    if (k > 0 && (!use_mtp || sbuf[0] == drafts[0])) {
-                        const strata::spec::DraftPolicy::Pick pk = policy.choose(T, k, sfx_match);
-                        if (pk.lookup) { T = pk.t; from_sfx = true; }
+                bool merged = false;
+                if (can_tree) {
+                    T = td_tree.total_tokens;
+                    T_mtp = T;
+                    ver.set_tree_window(td_tree.pos_offsets, td_tree.parent_slot, td_tree.attn_mask, td_tree.total_tokens);
+                    window[0] = x;
+                    for (int i = 1; i < T; ++i) window[(size_t) i] = td_tree.tokens[i];
+                } else {
+                    ver.clear_tree_window();
+                    T = use_mtp ? S_mtp : 1;   // no --mtp: one token a round unless a lookup draft fires
+                    if (use_mtp && req_spec_min_p > 0.0) {
+                        T = 1;
+                        while (T < S_mtp && dprob[(size_t) T - 1] >= (float) req_spec_min_p) ++T;
                     }
-                }
-                // --lookup-chain: what followed an earlier occurrence of the context + the MTP's drafts, after them
-                int chain_n = 0, cm = 0;
-                if (o.lookup_chain > 0 && !first_window && !from_sfx && T < S) {
-                    int csrc = -1;
-                    const int nt = chain_tail(sfx, drafts.data(), T - 1, ctail);
-                    chain_n = strata::spec::propose_from_sources(lookup_src, ctail.data(), nt, T - 1,
-                                                                 std::min(o.lookup_chain, S - T), o.lookup_chain_min,
-                                                                 cbuf.data(), &cm, &csrc);
-                    // the policy keeps the chained tokens that pay at this machine's measured window costs
-                    if (chain_n > 0 && !chain_fixed) {
-                        double p_mtp = 1.0;
-                        for (int i = 0; i < T - 1; ++i) p_mtp *= dprob[(size_t) i];
-                        chain_n = policy.chain(T, p_mtp, chain_n, cm);
+                    if (first_window) T = merge_T > 0 ? merge_T : 1;
+                    merged = first_window && merge_T > 0;   // the prompt's last tokens and the first token
+                    // a repeat of earlier context (prompt lookup) where the MTP's own first guess agrees: the policy takes it
+                    // when its expected tokens per ms, from the measured acceptance and window costs, beat the MTP window's
+                    if ((o.suffix_draft > 0 || think_ngram.enabled()) && !first_window) {
+                        int k = o.suffix_draft > 0 ? sfx.propose(S - 1, sbuf.data()) : 0;
+                        sfx_match = (k > 0) ? sfx.last_match() : 0;
+                        if (k <= 0 && think_ngram.enabled()) {
+                            k = think_ngram.propose(S - 1, sbuf.data(), &sfx_match);
+                        }
+                        if (k > 0 && (!use_mtp || sbuf[0] == drafts[0] || dprob[0] < 0.35f)) {
+                            const strata::spec::DraftPolicy::Pick pk = policy.choose(T, k, sfx_match);
+                            if (pk.lookup) { T = pk.t; from_sfx = true; }
+                        }
                     }
+                    // --lookup-chain: what followed an earlier occurrence of the context + the MTP's drafts, after them
+                    if (o.lookup_chain > 0 && !first_window && !from_sfx && T < S) {
+                        int csrc = -1;
+                        const int nt = chain_tail(sfx, drafts.data(), T - 1, ctail);
+                        chain_n = strata::spec::propose_from_sources(lookup_src, ctail.data(), nt, T - 1,
+                                                                     std::min(o.lookup_chain, S - T), o.lookup_chain_min,
+                                                                     cbuf.data(), &cm, &csrc);
+                        // the policy keeps the chained tokens that pay at this machine's measured window costs
+                        if (chain_n > 0 && !chain_fixed) {
+                            double p_mtp = 1.0;
+                            for (int i = 0; i < T - 1; ++i) p_mtp *= dprob[(size_t) i];
+                            chain_n = policy.chain(T, p_mtp, chain_n, cm);
+                        }
+                    }
+                    T_mtp = T;
+                    T += chain_n;
+                    window[0] = x;
+                    for (int i = 1; i < T_mtp; ++i)
+                        window[(size_t) i] = merged     ? (int32_t) ids[(size_t) (p + i)]
+                                             : from_sfx ? sbuf[(size_t) i - 1]
+                                                        : drafts[(size_t) i - 1];
+                    for (int i = 0; i < chain_n; ++i) window[(size_t) (T_mtp + i)] = cbuf[(size_t) i];
                 }
-                const int T_mtp = T;
-                T += chain_n;
                 const bool timed_round = !first_window;
                 const Clock::time_point round0 = Clock::now();
                 if (p + T > o.max_context) break;
-                window[0] = x;
-                for (int i = 1; i < T_mtp; ++i)
-                    window[(size_t) i] = merged     ? (int32_t) ids[(size_t) (p + i)]
-                                         : from_sfx ? sbuf[(size_t) i - 1]
-                                                    : drafts[(size_t) i - 1];
-                for (int i = 0; i < chain_n; ++i) window[(size_t) (T_mtp + i)] = cbuf[(size_t) i];
                 drive.d.layers = 0;
                 drive.d.experts = 0;
                 drive.d.failed = false;
@@ -14456,98 +14552,230 @@ int main(int argc, char** argv) {
                         if (f) std::fclose(f);
                     }
                 }
-                int a = merged ? T - 1 : 0;   // a merged window commits every row, as the prompt windows do
-                while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
-                if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
-                if (chain_n > 0) { ++chain_windows; chain_drafts += chain_n; chain_ok += std::max(0, a - (T_mtp - 1)); }
-                if (!from_sfx && !first_window)
-                    for (int d = 0; d < T_mtp - 1 && d < 8 && d <= a; ++d) { ++dp_tested[d]; dp_ok[d] += d < a; }
-                if (strata::core::MtpDrafter::top2_env() && !from_sfx && !first_window && a < T_mtp - 1 && a < 8) {
-                    ++t2_rej[a];
-                    if (mtp.top2(a) == outv[(size_t) a]) ++t2_hit[a];
-                }
-                const Clock::time_point tw1 = Clock::now();
-                std::thread adapt_thr;   // the adaptive tier beside the commit and the draft (as in generate)
-                bool adapt_ok = true;
-                // (--adapt-async 1: the asynchronous tier above instead, ticked before the window)
-                if (!drive.d.usage.empty() && !ajob && ((rounds + 1) % o.adapt_every) == 0)
-                    adapt_thr = std::thread([&] { strata::aux_cpus::pin_current_thread(); adapt_ok = adapt(); });
-                if (!ver.commit(a + 1, err)) {
-                    if (adapt_thr.joinable()) adapt_thr.join();
-                    std::printf("ERR %s\n", err.c_str());
-                    return 1;
-                }
-                if (nonfinite_hit(ver, first_window ? "first decode" : "decode")) {   // #879: none of its tokens goes out
-                    if (adapt_thr.joinable()) adapt_thr.join();
+                if (can_tree) {
+                    std::vector<int32_t> acc_A = {0};
+                    const int lim_A = std::min(4, td_tree.branch_start - 1);
+                    for (int j = 0; j < lim_A; ++j) {
+                        const int slot = 1 + j;
+                        if (window[(size_t) slot] == outv[(size_t) acc_A.back()]) {
+                            acc_A.push_back(slot);
+                        } else {
+                            break;
+                        }
+                    }
+                    std::vector<int32_t> acc_B = {0};
+                    const int broot = td_tree.branch_root_slot;
+                    if (broot >= 0 && broot < (int) acc_A.size() && acc_A[(size_t) broot] == broot) {
+                        acc_B.assign(acc_A.begin(), acc_A.begin() + broot + 1);
+                        if (td_tree.branch_start > 0 && td_tree.branch_start < td_tree.total_tokens &&
+                            window[(size_t) td_tree.branch_start] == outv[(size_t) broot]) {
+                            acc_B.push_back(td_tree.branch_start);
+                            for (int s = td_tree.branch_start + 1; s < td_tree.total_tokens; ++s) {
+                                if (window[(size_t) s] == outv[(size_t) acc_B.back()]) {
+                                    acc_B.push_back(s);
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    const bool win_B = (acc_B.size() > acc_A.size());
+                    const std::vector<int32_t>& acc = win_B ? acc_B : acc_A;
+                    const int n_keep = (int) acc.size();
+
+                    if (strata::core::MtpDrafter::top2_env()) {
+                        ++t2_rej[0];
+                        if (win_B) ++t2_hit[0];
+                    }
+
+                    const Clock::time_point tw1 = Clock::now();
+                    std::thread adapt_thr;   // the adaptive tier beside the commit and the draft (as in generate)
+                    bool adapt_ok = true;
+                    // (--adapt-async 1: the asynchronous tier above instead, ticked before the window)
+                    if (!drive.d.usage.empty() && !ajob && ((rounds + 1) % o.adapt_every) == 0)
+                        adapt_thr = std::thread([&] { strata::aux_cpus::pin_current_thread(); adapt_ok = adapt(); });
+
+                    if (!ver.commit_slots(acc.data(), n_keep, err)) {
+                        if (adapt_thr.joinable()) adapt_thr.join();
+                        std::printf("ERR %s\n", err.c_str());
+                        return 1;
+                    }
+                    ver.clear_tree_window();
+
+                    if (nonfinite_hit(ver, "decode")) {
+                        if (adapt_thr.joinable()) adapt_thr.join();
+                        if (!adapt_ok) {
+                            std::printf("ERR an adaptive refill failed\n");
+                            return 1;
+                        }
+                        finish = "nonfinite";
+                        break;
+                    }
+
+                    std::vector<int32_t> kept_out;
+                    for (int s : acc) kept_out.push_back(outv[(size_t) s]);
+                    for (int s : acc) consumed.push_back(window[(size_t) s]);
+
+                    draft_offered += T - 1;
+                    draft_accepted += n_keep - 1;
+
+                    bool eos = false;
+                    for (int i = 0; i < n_keep && produced_n < max_new && !eos; ++i) {
+                        const int32_t tok = kept_out[(size_t) i];
+                        std::printf("T %d\n", (int) tok);
+                        strata::core::progress_beat();
+                        ++produced_n;
+                        if (sfx_on) sfx.append(tok);
+                        if (think_ngram.enabled()) think_ngram.append(tok);
+                        if (o.lookup_chain > 0) extra_sources_append(&tok, 1);
+                        eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) tok) != o.eos_ids.end();
+                    }
+                    std::fflush(stdout);
+                    ++rounds;
+                    if (drive.d.fs) drive.d.fs->completed.fetch_add(1, std::memory_order_release);
+                    const Clock::time_point tw2 = Clock::now();
+
+                    if (use_mtp && hist_n > 0 && mtp.coupled() && !eos && produced_n < max_new)
+                        mtp.set_draft_history(consumed.data(), (int64_t) consumed.size(), kept_out.back());
+
+                    tree_draft_ready = !eos && produced_n < max_new &&
+                                       mtp.draft_tree(n_keep, kept_out.data(), p, 4, (float) req_spec_min_p, td_tree, err);
+                    if (tree_draft_ready) {
+                        for (int i = 0; i < 4; ++i) drafts[(size_t) i] = td_tree.tokens[1 + i];
+                        for (int i = 0; i < 4; ++i) dprob[(size_t) i] = td_tree.probs[1 + i];
+                    }
+                    const bool drafted = !use_mtp || eos || produced_n >= max_new || tree_draft_ready;
+
+                    {
+                        const Clock::time_point tw3 = Clock::now();
+                        auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
+                        dt_run += msd(tw0, tw1); dt_commit += msd(tw1, tw2); dt_draft += msd(tw2, tw3);
+                        ++dec_windows; dec_T += T;
+                    }
+                    pcie_auto_step(req_pcie_frac);
+                    if (adapt_thr.joinable()) {
+                        const Clock::time_point taj0 = Clock::now();
+                        adapt_thr.join();
+                        dt_adapt_join += std::chrono::duration<double, std::milli>(Clock::now() - taj0).count();
+                    }
                     if (!adapt_ok) {
                         std::printf("ERR an adaptive refill failed\n");
                         return 1;
                     }
-                    finish = "nonfinite";
-                    break;
+                    if (!drafted) {
+                        std::printf("ERR %s\n", err.c_str());
+                        return 1;
+                    }
+                    if (eos) { finish = "stop"; break; }
+                    if (stop_req.load()) { finish = "cancel"; break; }
+                    x = kept_out.back();
+                    p += n_keep;
+                } else {
+                    int a = merged ? T - 1 : 0;   // a merged window commits every row, as the prompt windows do
+                    while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+                    if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
+                    if (chain_n > 0) { ++chain_windows; chain_drafts += chain_n; chain_ok += std::max(0, a - (T_mtp - 1)); }
+                    if (!from_sfx && !first_window)
+                        for (int d = 0; d < T_mtp - 1 && d < 8 && d <= a; ++d) { ++dp_tested[d]; dp_ok[d] += d < a; }
+                    if (strata::core::MtpDrafter::top2_env() && !from_sfx && !first_window && a < T_mtp - 1 && a < 8) {
+                        ++t2_rej[a];
+                        if (mtp.top2(a) == outv[(size_t) a]) ++t2_hit[a];
+                    }
+                    const Clock::time_point tw1 = Clock::now();
+                    std::thread adapt_thr;   // the adaptive tier beside the commit and the draft (as in generate)
+                    bool adapt_ok = true;
+                    // (--adapt-async 1: the asynchronous tier above instead, ticked before the window)
+                    if (!drive.d.usage.empty() && !ajob && ((rounds + 1) % o.adapt_every) == 0)
+                        adapt_thr = std::thread([&] { strata::aux_cpus::pin_current_thread(); adapt_ok = adapt(); });
+                    if (!ver.commit(a + 1, err)) {
+                        if (adapt_thr.joinable()) adapt_thr.join();
+                        std::printf("ERR %s\n", err.c_str());
+                        return 1;
+                    }
+                    if (nonfinite_hit(ver, first_window ? "first decode" : "decode")) {   // #879: none of its tokens goes out
+                        if (adapt_thr.joinable()) adapt_thr.join();
+                        if (!adapt_ok) {
+                            std::printf("ERR an adaptive refill failed\n");
+                            return 1;
+                        }
+                        finish = "nonfinite";
+                        break;
+                    }
+                    // a merged window: the drafter's rows of the prompt tokens in it, as the prompt windows give them
+                    if (merged && use_mtp && !mtp.prefill(ver.final_R_all(), window.data() + 1, T - 1, p, err)) {
+                        if (adapt_thr.joinable()) adapt_thr.join();
+                        std::printf("ERR %s\n", err.c_str());
+                        return 1;
+                    }
+                    // the window's first a + 1 tokens are in the session now (the last output is not: it is next x)
+                    for (int i = 0; i <= a; ++i) consumed.push_back(window[(size_t) i]);
+                    if (!merged) {   // (a merged window's rows are prompt tokens, not drafts)
+                        draft_offered += T - 1;
+                        draft_accepted += a;
+                    }
+                    first_window = false;
+                    bool eos = false;
+                    for (int i = merged ? a : 0; i <= a && produced_n < max_new && !eos; ++i) {   // (merged: row T-1 only)
+                        std::printf("T %d\n", (int) outv[(size_t) i]);
+                        strata::core::progress_beat();
+                        ++produced_n;
+                        if (sfx_on) sfx.append(outv[(size_t) i]);
+                        if (think_ngram.enabled()) think_ngram.append(outv[(size_t) i]);
+                        if (o.lookup_chain > 0) extra_sources_append(&outv[(size_t) i], 1);
+                        eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
+                    }
+                    std::fflush(stdout);
+                    ++rounds;
+                    if (drive.d.fs) drive.d.fs->completed.fetch_add(1, std::memory_order_release);
+                    const Clock::time_point tw2 = Clock::now();
+                    // coupled drafts with penalties: the next window's row-0 history (`consumed` holds this window's
+                    // commit, outv[a] is its row 0) - the drafts extend it on the device as the verify rows will
+                    if (use_mtp && hist_n > 0 && mtp.coupled() && !eos && produced_n < max_new)
+                        mtp.set_draft_history(consumed.data(), (int64_t) consumed.size(), outv[(size_t) a]);
+                    bool drafted = true;
+                    if (use_mtp && !eos && produced_n < max_new) {
+                        if (strata::core::MtpDrafter::mtp_tree_enabled()) {
+                            tree_draft_ready = mtp.draft_tree(a + 1, outv.data(), p, 4, (float) req_spec_min_p, td_tree, err);
+                            if (tree_draft_ready) {
+                                for (int i = 0; i < 4; ++i) drafts[(size_t) i] = td_tree.tokens[1 + i];
+                                for (int i = 0; i < 4; ++i) dprob[(size_t) i] = td_tree.probs[1 + i];
+                            }
+                            drafted = tree_draft_ready;
+                        } else {
+                            drafted = mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p);
+                        }
+                    }
+                    {
+                        const Clock::time_point tw3 = Clock::now();
+                        auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
+                        dt_run += msd(tw0, tw1); dt_commit += msd(tw1, tw2); dt_draft += msd(tw2, tw3);
+                        ++dec_windows; dec_T += merged ? 1 : T;   // a merged window's prompt rows are not decode rows
+                    }
+                    pcie_auto_step(req_pcie_frac);   // the default share, refined from the CPU pool's speed (PcieAuto); a request's own share is left alone
+                    if (adapt_thr.joinable()) {
+                        const Clock::time_point taj0 = Clock::now();
+                        adapt_thr.join();
+                        dt_adapt_join += std::chrono::duration<double, std::milli>(Clock::now() - taj0).count();
+                    }
+                    if (!adapt_ok) {
+                        std::printf("ERR an adaptive refill failed\n");
+                        return 1;
+                    }
+                    if (!drafted) {
+                        std::printf("ERR %s\n", err.c_str());
+                        return 1;
+                    }
+                    if (timed_round && !eos && chain_n == 0)
+                        policy.observe(from_sfx, T, a, sfx_match,
+                                       std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
+                    else if (timed_round && !eos)   // a chained window: its MTP part, its chain, its cost
+                        policy.observe_chain(T_mtp, chain_n, a, cm,
+                                             std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
+                    if (eos) { finish = "stop"; break; }
+                    if (stop_req.load()) { finish = "cancel"; break; }
+                    x = outv[(size_t) a];
+                    p += a + 1;
                 }
-                // a merged window: the drafter's rows of the prompt tokens in it, as the prompt windows give them
-                if (merged && use_mtp && !mtp.prefill(ver.final_R_all(), window.data() + 1, T - 1, p, err)) {
-                    if (adapt_thr.joinable()) adapt_thr.join();
-                    std::printf("ERR %s\n", err.c_str());
-                    return 1;
-                }
-                // the window's first a + 1 tokens are in the session now (the last output is not: it is next x)
-                for (int i = 0; i <= a; ++i) consumed.push_back(window[(size_t) i]);
-                if (!merged) {   // (a merged window's rows are prompt tokens, not drafts)
-                    draft_offered += T - 1;
-                    draft_accepted += a;
-                }
-                first_window = false;
-                bool eos = false;
-                for (int i = merged ? a : 0; i <= a && produced_n < max_new && !eos; ++i) {   // (merged: row T-1 only)
-                    std::printf("T %d\n", (int) outv[(size_t) i]);
-                    strata::core::progress_beat();
-                    ++produced_n;
-                    if (sfx_on) sfx.append(outv[(size_t) i]);
-                    if (o.lookup_chain > 0) extra_sources_append(&outv[(size_t) i], 1);
-                    eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
-                }
-                std::fflush(stdout);
-                ++rounds;
-                if (drive.d.fs) drive.d.fs->completed.fetch_add(1, std::memory_order_release);
-                const Clock::time_point tw2 = Clock::now();
-                // coupled drafts with penalties: the next window's row-0 history (`consumed` holds this window's
-                // commit, outv[a] is its row 0) - the drafts extend it on the device as the verify rows will
-                if (use_mtp && hist_n > 0 && mtp.coupled() && !eos && produced_n < max_new)
-                    mtp.set_draft_history(consumed.data(), (int64_t) consumed.size(), outv[(size_t) a]);
-                const bool drafted = !use_mtp || eos || produced_n >= max_new ||
-                                     mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p);
-                {
-                    const Clock::time_point tw3 = Clock::now();
-                    auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
-                    dt_run += msd(tw0, tw1); dt_commit += msd(tw1, tw2); dt_draft += msd(tw2, tw3);
-                    ++dec_windows; dec_T += merged ? 1 : T;   // a merged window's prompt rows are not decode rows
-                }
-                pcie_auto_step(req_pcie_frac);   // the default share, refined from the CPU pool's speed (PcieAuto); a request's own share is left alone
-                if (adapt_thr.joinable()) {
-                    const Clock::time_point taj0 = Clock::now();
-                    adapt_thr.join();
-                    dt_adapt_join += std::chrono::duration<double, std::milli>(Clock::now() - taj0).count();
-                }
-                if (!adapt_ok) {
-                    std::printf("ERR an adaptive refill failed\n");
-                    return 1;
-                }
-                if (!drafted) {
-                    std::printf("ERR %s\n", err.c_str());
-                    return 1;
-                }
-                if (timed_round && !eos && chain_n == 0)
-                    policy.observe(from_sfx, T, a, sfx_match,
-                                   std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
-                else if (timed_round && !eos)   // a chained window: its MTP part, its chain, its cost
-                    policy.observe_chain(T_mtp, chain_n, a, cm,
-                                         std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
-                if (eos) { finish = "stop"; break; }
-                if (stop_req.load()) { finish = "cancel"; break; }
-                x = outv[(size_t) a];
-                p += a + 1;
             }
             const double decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
             // the last commit (set_commit_async): the session is complete before anything reads or copies it
@@ -15403,7 +15631,8 @@ int main(int argc, char** argv) {
         vh.slot_off = xcache.slot_offsets();   // E-6: the device plan's pointers
         vh.n_slots = xcache.slots();
         if (pcie_balance()) ver.set_pcie_balance(&drive.d.pcie_model);
-        if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err)) {
+        if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr,
+                      strata::core::MtpDrafter::mtp_tree_enabled() ? strata::kernels::kVerifyMaxT : o.spec, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
@@ -15650,7 +15879,9 @@ int main(int argc, char** argv) {
         std::vector<int64_t> accepted_hist((size_t) o.spec, 0);
         int64_t rounds = 0, drafts_total = 0, drafts_ok = 0, corrupt_counter = 0;
         const int S_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec;
-        if (use_mtp && S_mtp < o.spec) mtp.set_max_drafts(S_mtp - 1);
+        if (!strata::core::MtpDrafter::mtp_tree_enabled()) {
+            if (use_mtp && S_mtp < o.spec) mtp.set_max_drafts(S_mtp - 1);
+        }
         strata::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
         strata::spec::DraftPolicy policy(o.spec);   // MTP or lookup window (see draft_policy.hpp)
         std::vector<int32_t> sbuf((size_t) o.spec, 0);

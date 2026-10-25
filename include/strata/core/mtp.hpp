@@ -34,6 +34,19 @@ namespace strata::core {
 
 class NativeHead;
 
+/// STRATA_MTP_TREE=1: Top-2 branching 2x4 tree draft structure (8 tokens: root + 4 Branch A + 3 Branch B)
+struct TreeDraft {
+    int total_tokens = 0;
+    int branch_start = 0;
+    int branch_root_slot = 0;
+    int32_t tokens[8] = {};
+    int32_t pos_offsets[8] = {};
+    int32_t parent_slot[8] = {};
+    uint32_t attn_mask[8] = {};
+    float probs[8] = {};
+    float alt_prob = 0.0f;
+};
+
 class MtpDrafter {
 public:
     MtpDrafter() = default;
@@ -107,6 +120,12 @@ public:
     /// The first round: one cell (`cell`) from `R_row` (device) and `token` -> T-1 drafts.
     bool draft_first(int T, const float* R_row, int32_t token, int64_t cell, int32_t* drafts, std::string& err,
                      float* probs = nullptr, float min_p = 0.0f, int* n_drafts = nullptr);
+
+    /// STRATA_MTP_TREE=1: Top-2 branching 2x4 tree drafting (up to 8 tokens total).
+    bool draft_tree(int T_in, const int32_t* tokens_in, int64_t pos0, int max_linear, float min_p, TreeDraft& out,
+                    std::string& err);
+    static bool mtp_tree_enabled();
+    static bool mtp_device_chain_enabled();
 
     /// COUPLED DRAFT SAMPLING (core/coupled_draft.hpp; STRATA_SPEC_COUPLED=1, set up by bind()): the request's
     /// sampling.  A sampled request (temperature > 0, not greedy) then drafts by SAMPLING with the target's chain and
@@ -220,6 +239,7 @@ private:
     void record_top2(int j);
     std::vector<int32_t> top2_, dvocab_host_;
     std::vector<float> lg_host_;
+    float alt_prob_ = 0.0f;
     // --pipeline-windows 2 (chain_launch)
     bool stage_source_R(int T, std::string& err);   ///< set_source_R's rows into the bound buffer
     bool force_on_ = false, chain_live_ = false;

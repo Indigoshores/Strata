@@ -196,6 +196,15 @@ public:
     /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.
     bool commit(int n_keep, std::string& err);
 
+    /// Tree speculative verification (STRATA_MTP_TREE=1): configure tree topology for the next run().
+    void set_tree_window(const int32_t* pos_offsets, const int32_t* parent_slot, const uint32_t* attn_mask, int n_tokens);
+    void clear_tree_window();
+    bool tree_active() const { return tree_active_; }
+
+    /// Commit selected slots from tree verification. If accepted_slots is a linear prefix 0, 1, ..., n_keep-1,
+    /// this forwards to commit(n_keep, err). Otherwise, it compacts GDN/QSA state and commits.
+    bool commit_slots(const int32_t* accepted_slots, int n_keep, std::string& err);
+
     // ================================ SEVERAL SEQUENCES IN ONE WINDOW ================================
     //
     // A batch window holds S INDEPENDENT sequences, one token each: row s is slot s, at slot s's own position,
@@ -617,6 +626,13 @@ private:
     float *sh_gate_ = nullptr, *sh_up_ = nullptr, *sh_g_ = nullptr;
     float* hist_snap_ = nullptr;                              // T * NG_HIST * NG_HC_DIM
     int64_t cap_ = 0, max_blocks_ = 0, attn_scratch_floats_ = 0;
+
+    // Tree speculative verification state
+    bool tree_active_ = false;
+    int tree_n_ = 0;
+    int32_t* h_tree_pos_ = nullptr;     int32_t* m_tree_pos_ = nullptr;
+    int32_t* h_tree_parent_ = nullptr;  int32_t* m_tree_parent_ = nullptr;
+    uint32_t* h_tree_mask_ = nullptr;   uint32_t* m_tree_mask_ = nullptr;
 };
 
 }  // namespace strata::core

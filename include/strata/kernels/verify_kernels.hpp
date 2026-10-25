@@ -187,4 +187,23 @@ void dense_steps(const int32_t* cells, int n, int32_t* steps, void* stream);
 /// last `window` cells: ids[q * ids_stride + j] = max(0, n_kv - window) + j and the record's width = the count.
 void window_ids(int32_t* steps, int n, int window, int32_t* ids, int64_t ids_stride, void* stream);
 
+// ---- WDDM compute copy & tree speculative verification kernels
+/// Lightweight compute-kernel D2D copy avoiding WDDM DMA packet overhead.
+void compute_copy_d2d(void* dst, const void* src, size_t bytes, void* stream);
+/// Whether WDDM compute-kernel copy is enabled (default 1 on _WIN32 HIP; STRATA_WDDM_COPY_KERNEL=0 disables).
+bool wddm_copy_kernel_on();
+
+/// GDN recurrence over a tree window: forks at parent_slot[t] (e.g. slot 5 restores state from slot 0).
+void gdn_step_norm_tree(float* state, const float* h, int conv_channels, const float* gate, const float* beta,
+                        const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int n_tok,
+                        const int32_t* parent_slot, void* stream, int t_out_begin = 0, void* xq_out = nullptr);
+
+/// Compacts rows from accepted slots in a tree window into consecutive rows [0..n_keep).
+void compact_tree_slots(float* dst, const float* src, int64_t stride, const int32_t* accepted_slots, int n_keep,
+                        void* stream);
+void compact_tree_gdn_layers(float* qkv, float* h, float* gate, float* beta, int C, int HV, int MT, int n_layers,
+                             const int32_t* accepted_slots, int n_keep, void* stream);
+void compact_tree_qsa_indexer(float* idx_raw, int ID, int MT, int n_layers, const int32_t* accepted_slots, int n_keep,
+                              void* stream);
+
 }  // namespace strata::kernels

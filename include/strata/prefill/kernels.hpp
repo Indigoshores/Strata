@@ -79,6 +79,12 @@ void gdn_recurrence_variant(int variant, float* state, const float* h, const flo
 // ---- MoE
 /// softmax over 512, top-10 (ties to the lower id), weights renormalised over the ten (the native router).
 void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t n_expert, void* stream);
+/// Prune non-terminal prompt tokens' router tail (pos_in_prompt < n_total - 16) where w[t, k] < min_p, keeping rank 0.
+void router_tail_prune(int32_t* ids, float* w, int64_t T, int64_t c0, int64_t n_total, float min_p, void* stream);
+/// Initialize bo[t, :] = shared[t, :] * sigmoid(sg[t]) (or 0 if shared is null) for fused MoE scatter-add.
+void moe_init_bo(float* bo, const float* shared, const float* sg, int64_t T, void* stream);
+/// Add shared expert: bo[t, :] += shared[t, :] * sigmoid(sg[t]) when shared expert runs on side stream.
+void moe_add_shared(float* bo, const float* shared, const float* sg, int64_t T, void* stream);
 /// Expert blob (Strata pack layout, Q2_0) -> BF16 matrices: gate/up interleaved [1280, 2560], down [2560, 640].
 void blob_dequant(const uint8_t* blob, uint16_t* gu16, uint16_t* down16, void* stream);
 /// h16[n, r] = fp16(silu(gu[n, 2r]) * gu[n, 2r + 1])   (the interleaved expert gate/up)

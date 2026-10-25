@@ -242,7 +242,8 @@ __global__ inline void scan_buckets_kernel(Tables tb, int E, int max_bm = 64) {
 }
 
 __global__ inline void place_kernel(const int32_t* __restrict__ ids, int64_t n, int k, int E, Tables tb,
-                                    int32_t* __restrict__ slot, int32_t* __restrict__ src) {
+                                    int32_t* __restrict__ slot, int32_t* __restrict__ src,
+                                    const float* __restrict__ w = nullptr, float* __restrict__ rw = nullptr) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const int e = ids[i];
@@ -250,11 +251,13 @@ __global__ inline void place_kernel(const int32_t* __restrict__ ids, int64_t n, 
     const int p = atomicAdd(&tb.fill[e], 1);
     if (slot) slot[i] = p;
     if (src) src[p] = (int32_t) (i / k);
+    if (rw && w) rw[p] = w[i];
 }
 
 inline void group_bucketed(const int32_t* ids, int64_t n, int k, int n_expert,
                            void* scratch, int32_t* slot, int32_t* src,
-                           cudaStream_t stream = nullptr, int max_bm = 0) {
+                           cudaStream_t stream = nullptr, int max_bm = 0,
+                           const float* w = nullptr, float* rw = nullptr) {
     if (n_expert < 1 || n_expert > 1024) {
         std::fprintf(stderr, "group_bucketed: %d experts (the grouping takes 1 to 1024)\n", n_expert);
         std::exit(1);
@@ -268,9 +271,9 @@ inline void group_bucketed(const int32_t* ids, int64_t n, int k, int n_expert,
     const unsigned threads = (unsigned) std::max(32, ((n_expert + 31) / 32 * 32));
     const int effective_max_bm = (max_bm == 16 || max_bm == 32 || max_bm == 64) ? max_bm : pick_max_bm(n, n_expert);
     scan_buckets_kernel<<<1, threads, 0, stream>>>(tb, n_expert, effective_max_bm);
-    if (n > 0 && (slot != nullptr || src != nullptr)) {
+    if (n > 0 && (slot != nullptr || src != nullptr || rw != nullptr)) {
         unsigned nb = (unsigned) ((n + 255) / 256);
-        place_kernel<<<nb, 256, 0, stream>>>(ids, n, k, n_expert, tb, slot, src);
+        place_kernel<<<nb, 256, 0, stream>>>(ids, n, k, n_expert, tb, slot, src, w, rw);
     }
 }
 

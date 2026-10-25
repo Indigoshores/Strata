@@ -631,8 +631,8 @@ void quantize_act(const float* x, int64_t rows, int64_t cols, void* xa, void* st
 }
 
 void group(const int32_t* ids, int64_t n, int k, int n_expert, void* scratch, int32_t* slot, int32_t* src,
-           void* stream) {
-    group_bucketed(ids, n, k, n_expert, scratch, slot, src, (cudaStream_t) stream);
+           void* stream, const float* w, float* rw) {
+    group_bucketed(ids, n, k, n_expert, scratch, slot, src, (cudaStream_t) stream, 0, w, rw);
     ck(cudaGetLastError(), "group");
 }
 

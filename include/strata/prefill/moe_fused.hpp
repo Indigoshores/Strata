@@ -49,7 +49,7 @@ void quantize_act(const float* x, int64_t rows, int64_t cols, void* xa, void* st
 /// group_bytes(n, n_expert)), `slot[i]` = the row of pair i (the row of the per-slot outputs the combine reads) and
 /// `src[row]` = its token (i / k).  The order of the rows within an expert is not fixed; no output depends on it.
 void group(const int32_t* ids, int64_t n, int k, int n_expert, void* scratch, int32_t* slot, int32_t* src,
-           void* stream);
+           void* stream, const float* w = nullptr, float* rw = nullptr);
 
 /// Experts [e0, e1) of one layer (e1 - e0 <= kMaxBatch); blob[e - e0]: the Strata Q2_0 blob of expert e on the
 /// device (16-byte aligned), read only for an expert with rows.

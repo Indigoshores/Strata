@@ -54,13 +54,38 @@ std::vector<std::pair<std::string, std::string>> arch_default_env(const char* gc
         {"STRATA_GDN_SPLIT", "1"},       // the GDN step over 4 blocks per head (S25/S26)
         {"STRATA_QFUSE", "1"},           // activation q8_1 images written by their producers (S26)
         {"STRATA_PLE_BATCH", "1"},       // the verify window's PLE key / value projections at once (S25)
+#if defined(_WIN32)
+        {"STRATA_SH_STREAM", "0"},       // Windows WDDM: single-stream decode yields +16.4% decode speed (Phase 1)
+#else
         {"STRATA_SH_STREAM", "1"},       // the shared expert on its own stream: decode +1.8% / +6.7% (UD-Q4_K_XL) (140-m)
+#endif
         {"STRATA_PF_Z_STREAM", "1"},     // GDN Z-projection side-stream overlap (Gufo #758 da4d8b82)
         {"STRATA_GDN_CHUNKED", "1"},     // chunked DeltaNet recurrence on gfx11 matrix cores (Gufo #758 29e900c9)
-        {"STRATA_WDDM_FLUSH", "1"},      // scoped WDDM decode flush before host wait (Gufo 2eb0778a)
+        {"STRATA_WDDM_FLUSH", "0"},      // Pass 5B.4: 0 avoids unnecessary synchronous WDDM flush overhead
+        {"STRATA_MOE_MAX_BM", "64"},     // Pass 5B.4: grouped MoE max block multiple
+        {"STRATA_FUSE_HITS", "1"},       // graph fusion: fuse hits
+        {"STRATA_FUSE_WAIT", "1"},       // graph fusion: fuse wait
+        {"STRATA_HEAD_MIX_MULTI", "1"},  // graph fusion: multi-head mix
+        {"STRATA_QFUSE_HC", "1"},        // graph fusion: Q-fuse HC
         {"STRATA_ADMIT_MERGE_FIRST", "1"},// merge trailing prompt header tokens into first verify window
         {"STRATA_CKPT_POOL", "1"},       // reuse conversation checkpoint vector buffers
         {"STRATA_PF_SWITCH_MIN_T", "128"},// warmup WMMA GEMM / hipBLASLt plans for chunked prefill
+        {"STRATA_PF_FUSED", "1"},        // zero-sync GPU fused experts prefill
+        {"STRATA_PF_F16", "0"},          // INT8 native experts prefill (Stage 5B.1 beats FP16 on gfx1151)
+        {"STRATA_PREFILL_STREAM_MIN", "16"}, // stream all experts for T >= 16 on gfx1151
+        {"STRATA_PF_MOE_SCATTER", "0"},  // combine directly via m.Dm (avoids atomicAdd contention)
+        {"STRATA_PF_HC_WMMA_Q8", "0"},   // disable prefill HC WMMA Q8 fallback
+        {"STRATA_EXPDEC", "0"},          // expert decode: 0 preserves full WGP occupancy on gfx1151
+        {"STRATA_EXP_MODE", "8"},        // fused LDS gate+up+SwiGLU+q8_1 + LDS down across IQ3_S/IQ4_XS/IQ4_NL/Q8_0 (Pass 6E)
+        {"STRATA_S27_FUSE_GU", "1"},     // fuse gate & up decode projection (Pass 6C)
+        {"STRATA_EXPDEC_FUSE_GU", "1"},  // helper when STRATA_EXPDEC=1 is explicitly tested
+        {"STRATA_FAST_LOAD", "1"},       // fast tensor loading
+        {"STRATA_BULK_RING_MIB", "96"},  // staging ring size (MiB)
+        {"STRATA_BULK_THREADS", "16"},   // bulk load worker threads
+        {"STRATA_PREFETCH_WINDOW", "192"},// prefetch window size
+        {"STRATA_VERIFY_COHERENT", "1"}, // coherent verify window reads
+        {"STRATA_MTP_DEVICE_CHAIN", "1"},// GPU-side MTP draft validation chain
+        {"STRATA_WDDM_COPY_KERNEL", "1"},// GPU copy kernel for WDDM staging
     };
     return t;
 }

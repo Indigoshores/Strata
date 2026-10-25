@@ -32,6 +32,8 @@
 
 namespace strata::core {
 
+class ExpertSource;
+
 /// Where one expert's VRAM lives, or -1.  `int32_t` and not a bool because the slot index is what the kernel
 /// needs, and a table that has to be re-derived from a bitmask is a table that will be re-derived differently
 /// in the two places that use it.
@@ -227,6 +229,9 @@ public:
             int32_t slot = -1;
             const uint8_t* host_blob = nullptr;
             int64_t bytes = 0;
+            ExpertSource* src = nullptr;
+            int32_t layer = -1;
+            int32_t expert = -1;
         };
 
         explicit BulkUploadSession(ExpertCache& cache);
@@ -239,11 +244,12 @@ public:
         bool finish(std::string& err);
 
         size_t retained_staging_bytes() const {
-            return (buf_[0] ? kRingBufferSize : 0) + (buf_[1] ? kRingBufferSize : 0);
+            return (buf_[0] ? ring_bytes_ : 0) + (buf_[1] ? ring_bytes_ : 0);
         }
+        size_t ring_bytes() const { return ring_bytes_; }
 
     private:
-        static constexpr size_t kRingBufferSize = 16 * 1024 * 1024;
+        size_t ring_bytes_ = 64 * 1024 * 1024;
         ExpertCache& cache_;
         uint8_t* buf_[2] = {nullptr, nullptr};
         void* stream_ = nullptr;

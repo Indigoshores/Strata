@@ -1,5 +1,6 @@
 // src/core/expert_cache.cpp - R4's slot storage and residency table.  Read the header first.
 #include "strata/core/expert_cache.hpp"
+#include "strata/core/expert_source.hpp"
 
 // #533's segmented cache uses CUDA's virtual memory management (cuMem*): not on HIP, neither the RDNA backend nor
 // the gfx906 compat build (PR #638), which compiles this file as HIP without STRATA_USE_HIP
@@ -895,16 +896,73 @@ ExpertCache::BulkUploadSession::~BulkUploadSession() {
     (void) finish(err);
 }
 
+static size_t get_bulk_ring_bytes() {
+    size_t ring_mib = 96;
+    const char* env = std::getenv("STRATA_BULK_RING_MIB");
+    if (env && *env) {
+        char* end = nullptr;
+        unsigned long val = std::strtoul(env, &end, 10);
+        if (end != env && val > 0) {
+            ring_mib = static_cast<size_t>(val);
+        }
+    }
+    if (ring_mib < 16) ring_mib = 16;
+    if (ring_mib > 128) ring_mib = 128;
+    return ring_mib * 1024 * 1024;
+}
+
+static unsigned int get_bulk_threads() {
+    unsigned int n_threads = 16;
+    const char* env = std::getenv("STRATA_BULK_THREADS");
+    if (env && *env) {
+        char* end = nullptr;
+        unsigned long val = std::strtoul(env, &end, 10);
+        if (end != env && val > 0) {
+            n_threads = static_cast<unsigned int>(val);
+        }
+    }
+    unsigned int hw = std::thread::hardware_concurrency();
+    if (hw > 0) {
+        n_threads = std::min(n_threads, hw);
+    }
+    if (n_threads < 1) n_threads = 1;
+    if (n_threads > 16) n_threads = 16;
+    return n_threads;
+}
+
 bool ExpertCache::BulkUploadSession::init(std::string& err) {
     if (initialized_) return true;
 
-    for (int i = 0; i < 2; ++i) {
-        cudaError_t e = cudaHostAlloc(reinterpret_cast<void**>(&buf_[i]), kRingBufferSize, cudaHostAllocDefault);
-        if (e != cudaSuccess) {
-            err = std::string("ExpertCache::BulkUploadSession: cudaHostAlloc failed: ") + cudaGetErrorString(e);
-            (void) finish(err);
-            return false;
+    size_t target_ring = get_bulk_ring_bytes();
+    bool allocated = false;
+
+    while (target_ring >= 16 * 1024 * 1024) {
+        bool ok = true;
+        for (int i = 0; i < 2; ++i) {
+            cudaError_t e = cudaHostAlloc(reinterpret_cast<void**>(&buf_[i]), target_ring, cudaHostAllocDefault);
+            if (e != cudaSuccess) {
+                ok = false;
+                break;
+            }
         }
+        if (ok) {
+            ring_bytes_ = target_ring;
+            allocated = true;
+            break;
+        }
+        for (int i = 0; i < 2; ++i) {
+            if (buf_[i]) {
+                cudaFreeHost(buf_[i]);
+                buf_[i] = nullptr;
+            }
+        }
+        target_ring /= 2;
+    }
+
+    if (!allocated) {
+        err = "ExpertCache::BulkUploadSession: cudaHostAlloc failed even at 16 MiB floor";
+        (void) finish(err);
+        return false;
     }
 
     for (int i = 0; i < 2; ++i) {
@@ -924,9 +982,7 @@ bool ExpertCache::BulkUploadSession::init(std::string& err) {
         return false;
     }
 
-    unsigned int n_threads = std::thread::hardware_concurrency();
-    if (n_threads == 0) n_threads = 4;
-    n_threads = std::min(n_threads, 4u);
+    unsigned int n_threads = get_bulk_threads();
     if (n_threads > 1) {
         pool_ = std::make_unique<WorkerPool>(n_threads - 1);
     }
@@ -950,7 +1006,7 @@ bool ExpertCache::BulkUploadSession::upload(const Item* items, size_t count, std
 
         while (idx < count) {
             const auto& it = items[idx];
-            if (it.bytes > static_cast<int64_t>(kRingBufferSize)) {
+            if (it.bytes > static_cast<int64_t>(ring_bytes_)) {
                 if (batch_start == idx) {
                     if (event_recorded_[active_buf_]) {
                         strata_wddm_flush(static_cast<cudaStream_t>(stream_));
@@ -969,7 +1025,15 @@ bool ExpertCache::BulkUploadSession::upload(const Item* items, size_t count, std
                             return false;
                         }
                     }
-                    if (!cache_.fill_slot_blocking(it.slot, it.host_blob, err, it.bytes)) {
+                    const uint8_t* blob_ptr = it.host_blob;
+                    if (blob_ptr == nullptr && it.src != nullptr && it.layer >= 0 && it.expert >= 0) {
+                        blob_ptr = it.src->blob_stable(it.layer, it.expert);
+                    }
+                    if (blob_ptr == nullptr) {
+                        err = "ExpertCache::BulkUploadSession: null host blob pointer";
+                        return false;
+                    }
+                    if (!cache_.fill_slot_blocking(it.slot, blob_ptr, err, it.bytes)) {
                         return false;
                     }
                     idx++;
@@ -980,7 +1044,7 @@ bool ExpertCache::BulkUploadSession::upload(const Item* items, size_t count, std
                 }
             }
 
-            if (batch_bytes + static_cast<size_t>(it.bytes) > kRingBufferSize) {
+            if (batch_bytes + static_cast<size_t>(it.bytes) > ring_bytes_) {
                 break;
             }
 
@@ -1004,14 +1068,23 @@ bool ExpertCache::BulkUploadSession::upload(const Item* items, size_t count, std
 
         size_t batch_count = idx - batch_start;
         uint8_t* dst_buf = buf_[p];
+        std::atomic<bool> copy_ok{true};
         std::vector<std::function<void()>> copy_tasks;
         copy_tasks.reserve(batch_count);
 
         for (size_t k = 0; k < batch_count; ++k) {
             const Item* cur_item = &items[batch_start + k];
             size_t off = offsets[k];
-            copy_tasks.emplace_back([dst_buf, off, cur_item] {
-                std::memcpy(dst_buf + off, cur_item->host_blob, static_cast<size_t>(cur_item->bytes));
+            copy_tasks.emplace_back([dst_buf, off, cur_item, &copy_ok] {
+                if (cur_item->host_blob != nullptr) {
+                    std::memcpy(dst_buf + off, cur_item->host_blob, static_cast<size_t>(cur_item->bytes));
+                } else if (cur_item->src != nullptr && cur_item->layer >= 0 && cur_item->expert >= 0) {
+                    if (!cur_item->src->copy_blob(cur_item->layer, cur_item->expert, dst_buf + off)) {
+                        copy_ok.store(false, std::memory_order_relaxed);
+                    }
+                } else {
+                    copy_ok.store(false, std::memory_order_relaxed);
+                }
             });
         }
         if (pool_) {
@@ -1020,20 +1093,59 @@ bool ExpertCache::BulkUploadSession::upload(const Item* items, size_t count, std
             for (auto& t : copy_tasks) t();
         }
 
+        if (!copy_ok.load(std::memory_order_relaxed)) {
+            err = "ExpertCache::BulkUploadSession: copy_blob failed";
+            return false;
+        }
+
+        std::vector<uint8_t*> dev_ptrs(batch_count);
         for (size_t k = 0; k < batch_count; ++k) {
             const Item& it = items[batch_start + k];
-            uint8_t* dev_dst = cache_.device_slot(it.slot);
-            if (dev_dst == nullptr) {
+            dev_ptrs[k] = cache_.device_slot(it.slot);
+            if (dev_ptrs[k] == nullptr) {
                 err = "ExpertCache::BulkUploadSession: slot outside arena";
                 return false;
             }
-            cudaError_t e = cudaMemcpyAsync(dev_dst, dst_buf + offsets[k], static_cast<size_t>(it.bytes),
+            const int64_t slot_cap = static_cast<int64_t>(cache_.slot_room(it.slot));
+            if (it.bytes > slot_cap) {
+                err = "ExpertCache::BulkUploadSession: item bytes (" + std::to_string(it.bytes) +
+                      ") exceed slot capacity (" + std::to_string(slot_cap) + ") for slot " +
+                      std::to_string(it.slot);
+                return false;
+            }
+        }
+
+        size_t k = 0;
+        while (k < batch_count) {
+            const Item& first_it = items[batch_start + k];
+            uint8_t* run_dev_dst = dev_ptrs[k];
+            uint8_t* run_host_src = dst_buf + offsets[k];
+            size_t run_bytes = static_cast<size_t>(first_it.bytes);
+            size_t run_items = 1;
+
+            size_t r = k + 1;
+            while (r < batch_count) {
+                const Item& next_it = items[batch_start + r];
+                uint8_t* next_dev_dst = dev_ptrs[r];
+                uint8_t* next_host_src = dst_buf + offsets[r];
+                if (next_dev_dst == run_dev_dst + run_bytes && next_host_src == run_host_src + run_bytes) {
+                    run_bytes += static_cast<size_t>(next_it.bytes);
+                    run_items++;
+                    r++;
+                } else {
+                    break;
+                }
+            }
+
+            cudaError_t e = cudaMemcpyAsync(run_dev_dst, run_host_src, run_bytes,
                                             cudaMemcpyHostToDevice, static_cast<cudaStream_t>(stream_));
             if (e != cudaSuccess) {
                 err = std::string("ExpertCache::BulkUploadSession: cudaMemcpyAsync failed: ") + cudaGetErrorString(e);
                 return false;
             }
-            cache_.increment_fills(1);
+            cache_.increment_fills(static_cast<int64_t>(run_items));
+
+            k = r;
         }
 
         cudaError_t er = cudaEventRecord(static_cast<cudaEvent_t>(events_[p]), static_cast<cudaStream_t>(stream_));
@@ -1082,6 +1194,7 @@ bool ExpertCache::BulkUploadSession::finish(std::string& err) {
         }
     }
 
+    ring_bytes_ = 0;
     active_buf_ = 0;
     initialized_ = false;
     return err.empty();

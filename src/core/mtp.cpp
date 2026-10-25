@@ -96,7 +96,30 @@ struct Bump {
     }
 };
 
+#if defined(STRATA_USE_HIP)
+inline bool mtp_coherent_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_VERIFY_COHERENT");
+        if (v != nullptr) return std::atoi(v) != 0;
+        int dev = 0;
+        cudaDeviceProp p;
+        return cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&p, dev) == cudaSuccess &&
+               strata::kernels::gfx_arch_is_gfx1151(p.gcnArchName);
+    }();
+    return on;
+}
+#endif
+
 bool mapped(size_t bytes, void** h, void** d) {
+#if defined(STRATA_USE_HIP)
+    if (mtp_coherent_on()) {
+        if (hipHostMalloc(h, bytes, hipHostMallocMapped | hipHostMallocCoherent |
+                                        (peer_portable() ? hipHostMallocPortable : 0)) != hipSuccess)
+            return false;
+        std::memset(*h, 0, bytes);
+        return cudaHostGetDevicePointer(d, *h, 0) == cudaSuccess;
+    }
+#endif
     if (cudaHostAlloc(h, bytes, cudaHostAllocMapped | (peer_portable() ? cudaHostAllocPortable : 0)) != cudaSuccess) return false;
     std::memset(*h, 0, bytes);
     return cudaHostGetDevicePointer(d, *h, 0) == cudaSuccess;
@@ -521,8 +544,29 @@ bool MtpDrafter::top2_env() {
     return on;
 }
 
-// STRATA_MTP_TOP2=1 (a diagnostic for tree drafts): draft j's runner-up under the draft layer, from the head logits
-// the step just wrote (row 0), on the host.  Slow; only for measuring what a second branch would have caught.
+bool MtpDrafter::mtp_tree_enabled() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_MTP_TREE"); return v && v[0] == '1'; }();
+    return on;
+}
+
+bool MtpDrafter::mtp_device_chain_enabled() {
+#if defined(STRATA_USE_HIP)
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_MTP_DEVICE_CHAIN");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    return on;
+#else
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_MTP_DEVICE_CHAIN");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    return on;
+#endif
+}
+
+// STRATA_MTP_TOP2=1 or STRATA_MTP_TREE=1: draft j's runner-up under the draft layer, from the head logits
+// the step just wrote (row 0), on the host.
 void MtpDrafter::record_top2(int j) {
     const int64_t nv = dhead_ != nullptr ? n_dvocab_ : n_vocab_;
     if ((int64_t) lg_host_.size() < nv) lg_host_.resize((size_t) nv);
@@ -530,6 +574,7 @@ void MtpDrafter::record_top2(int j) {
     if (j < 0 || j >= max_t_) return;
     if (cudaMemcpy(lg_host_.data(), head_logits_, (size_t) nv * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
         top2_[(size_t) j] = -1;
+        alt_prob_ = 0.0f;
         return;
     }
     int64_t b1 = -1, b2 = -1;
@@ -539,6 +584,16 @@ void MtpDrafter::record_top2(int j) {
         else if (b2 < 0 || v > lg_host_[(size_t) b2]) b2 = i;
     }
     top2_[(size_t) j] = b2 < 0 ? -1 : dhead_ != nullptr ? dvocab_host_[(size_t) b2] : (int32_t) b2;
+    if (b1 >= 0 && b2 >= 0) {
+        const float max_l = lg_host_[(size_t) b1];
+        double sum_e = 0.0;
+        for (int64_t i = 0; i < nv; ++i) {
+            sum_e += std::exp((double) lg_host_[(size_t) i] - max_l);
+        }
+        alt_prob_ = (sum_e > 0.0) ? (float) (std::exp((double) lg_host_[(size_t) b2] - max_l) / sum_e) : 0.0f;
+    } else {
+        alt_prob_ = 0.0f;
+    }
 }
 
 uint64_t MtpDrafter::bind_bytes(uint64_t head_row_bytes, int64_t n_vocab) const {
@@ -1632,43 +1687,88 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         pss->ple.table->prefetch_rows(rows16);
     };
 
-    int n = 0;
-    if (min_p <= 0.0f && max_steps > 0) {
-        if (cudaGraphLaunch(cp ? round_exec_c_[T] : round_exec_[T], cs_) != cudaSuccess) {
-            err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
-            return false;
+    auto wait_step = [&](int j) {
+        uint32_t spins = 0;
+        while (((volatile int32_t*) h_out_)[j] < 0) {
+#if defined(_WIN32) || defined(__x86_64__)
+            _mm_pause();
+#endif
+            if ((++spins & 1023u) == 0 && cudaStreamQuery(cs_) != cudaErrorNotReady) break;
         }
-        for (int j = 1; j < max_steps; ++j) {
-            if (cudaGraphLaunch(cp ? step_exec_c_[j] : step_exec_[j], cs_) != cudaSuccess) {
-                err = std::string("mtp draft step: ") + cudaGetErrorString(cudaGetLastError());
+    };
+#if defined(STRATA_USE_HIP)
+    const bool g_coherent_mtp = mtp_coherent_on();
+#else
+    const bool g_coherent_mtp = false;
+#endif
+    auto sync_or_wait = [&](int last_step) {
+        if (g_coherent_mtp) {
+            wait_step(last_step);
+            if (((volatile int32_t*) h_out_)[last_step] < 0) {
+                strata_wddm_flush(cs_);
+                if (cudaStreamSynchronize(cs_) != cudaSuccess) {
+                    err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
+                    return false;
+                }
+            }
+        } else {
+            strata_wddm_flush(cs_);
+            if (cudaStreamSynchronize(cs_) != cudaSuccess) {
+                err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
                 return false;
             }
         }
-        (void) cudaStreamQuery(cs_);
-        prefetch_ple(tokens[a]);
-        progress_at("mtp draft: waiting for the GPU");   // #2065
-        for (int j = 0; j + 1 < max_steps; ++j) {
-            uint32_t spins = 0;
-            while (((volatile int32_t*) h_out_)[j] < 0) {
-#if defined(_WIN32) || defined(__x86_64__)
-                _mm_pause();
-#endif
-                if ((++spins & 1023u) == 0 && cudaStreamQuery(cs_) != cudaErrorNotReady) break;
+        return true;
+    };
+
+    int n = 0;
+    const bool dev_chain = mtp_device_chain_enabled();
+    if ((min_p <= 0.0f || dev_chain) && max_steps > 0) {
+        if (top2_env() || mtp_tree_enabled()) {
+            if (cudaGraphLaunch(cp ? round_exec_c_[T] : round_exec_[T], cs_) != cudaSuccess) {
+                err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
+                return false;
             }
+            (void) cudaStreamQuery(cs_);
+            prefetch_ple(tokens[a]);
+            if (!sync_or_wait(0)) return false;
+            record_top2(0);
+            for (int j = 1; j < max_steps; ++j) {
+                if (cudaGraphLaunch(cp ? step_exec_c_[j] : step_exec_[j], cs_) != cudaSuccess) {
+                    err = std::string("mtp draft step: ") + cudaGetErrorString(cudaGetLastError());
+                    return false;
+                }
+            }
+            if (max_steps > 1) (void) cudaStreamQuery(cs_);
+        } else {
+            if (cudaGraphLaunch(cp ? round_exec_c_[T] : round_exec_[T], cs_) != cudaSuccess) {
+                err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
+            for (int j = 1; j < max_steps; ++j) {
+                if (cudaGraphLaunch(cp ? step_exec_c_[j] : step_exec_[j], cs_) != cudaSuccess) {
+                    err = std::string("mtp draft step: ") + cudaGetErrorString(cudaGetLastError());
+                    return false;
+                }
+            }
+            (void) cudaStreamQuery(cs_);
+            prefetch_ple(tokens[a]);
+        }
+        if (!sync_or_wait(0)) return false;
+        drafts[0] = ((volatile int32_t*) h_out_)[0];
+        float pj = ((volatile float*) h_prob_)[0];
+        if (probs) probs[0] = pj;
+        prefetch_ple(drafts[0]);
+        n = 1;
+        for (int j = 1; j < max_steps && (min_p <= 0.0f || pj >= min_p); ++j) {
+            if (!sync_or_wait(j)) return false;
             drafts[j] = ((volatile int32_t*) h_out_)[j];
-            if (probs) probs[j] = ((volatile float*) h_prob_)[j];
+            pj = ((volatile float*) h_prob_)[j];
+            if (probs) probs[j] = pj;
             prefetch_ple(drafts[j]);
+            ++n;
         }
-        strata_wddm_flush(cs_);
-        if (cudaStreamSynchronize(cs_) != cudaSuccess) {
-            err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
-            return false;
-        }
-        const int last = max_steps - 1;
-        drafts[last] = ((volatile int32_t*) h_out_)[last];
-        if (probs) probs[last] = ((volatile float*) h_prob_)[last];
-        prefetch_ple(drafts[last]);
-        n = max_steps;
+        if (n < max_steps && !sync_or_wait(max_steps - 1)) return false;
     } else if (max_steps > 0) {
         g_dt.init();
         const bool dt = g_dt.on;
@@ -1684,18 +1784,10 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         (void) cudaStreamQuery(cs_);
         prefetch_ple(tokens[a]);
         progress_at("mtp draft: waiting for the GPU");   // #2065: a stall here read as "decode", the verify window before it
-        auto wait_step = [&](int j) {
-            uint32_t spins = 0;
-            while (((volatile int32_t*) h_out_)[j] < 0) {
-#if defined(_WIN32) || defined(__x86_64__)
-                _mm_pause();
-#endif
-                if ((++spins & 1023u) == 0 && cudaStreamQuery(cs_) != cudaErrorNotReady) break;
-            }
-        };
         tl = Clock::now();
         wait_step(0);
         if (dt) g_dt.wait0_ms += hms(tl);
+        if (top2_env() || mtp_tree_enabled()) record_top2(0);
         drafts[0] = ((volatile int32_t*) h_out_)[0];
         float pj = ((volatile float*) h_prob_)[0];
         if (probs) probs[0] = pj;
@@ -1756,10 +1848,14 @@ bool MtpDrafter::stage_source_R(int T, std::string& err) {
     if (src_R_ == nullptr || src_R_ == window_R_) return true;
     const Clock::time_point t_src = Clock::now();
     struct SrcTime { MtpDrafter& d; Clock::time_point t; ~SrcTime() { d.ms_src += ms_since(t); ++d.n_src; } } src_time{*this, t_src};
-    if (cudaMemcpyAsync((void*) window_R_, src_R_, (size_t) T * (size_t) (g_->hc * g_->n_embd) * sizeof(float),
-                        cudaMemcpyDeviceToDevice, cs_) != cudaSuccess) {
-        err = "mtp: staging the window's residual rows failed";
-        return false;
+    const size_t bytes = (size_t) T * (size_t) (g_->hc * g_->n_embd) * sizeof(float);
+    if (strata::kernels::wddm_copy_kernel_on()) {
+        strata::kernels::compute_copy_d2d((void*) window_R_, src_R_, bytes, cs_);
+    } else {
+        if (cudaMemcpyAsync((void*) window_R_, src_R_, bytes, cudaMemcpyDeviceToDevice, cs_) != cudaSuccess) {
+            err = "mtp: staging the window's residual rows failed";
+            return false;
+        }
     }
     return true;
 }
@@ -1877,14 +1973,146 @@ bool MtpDrafter::draft_first(int T, const float* R_row, int32_t token, int64_t c
     const OnDevice on_device(device_);
     // row 0 is the real pair; rows 1.. repeat it and only write cells the next round overwrites
     const int64_t HCN = g_->hc * g_->n_embd;
-    for (int t = 0; t < T; ++t)
-        if (cudaMemcpy((void*) (window_R_ + (size_t) t * HCN), R_row, (size_t) HCN * sizeof(float),
-                       cudaMemcpyDeviceToDevice) != cudaSuccess) {
-            err = "mtp: staging the first residual failed";
-            return false;
+    for (int t = 0; t < T; ++t) {
+        if (strata::kernels::wddm_copy_kernel_on()) {
+            strata::kernels::compute_copy_d2d(
+                    (void*) (window_R_ + (size_t) t * HCN), R_row, (size_t) HCN * sizeof(float), cs_);
+        } else {
+            if (cudaMemcpyAsync((void*) (window_R_ + (size_t) t * HCN), R_row, (size_t) HCN * sizeof(float),
+                                cudaMemcpyDeviceToDevice, cs_) != cudaSuccess) {
+                err = "mtp: staging the first residual failed";
+                return false;
+            }
         }
+    }
     std::vector<int32_t> toks((size_t) T, token);
     return draft(T, toks.data(), cell, 0, drafts, err, probs, min_p, n_drafts);
+}
+
+bool MtpDrafter::draft_tree(int T_in, const int32_t* tokens_in, int64_t pos0, int max_linear, float min_p,
+                            TreeDraft& out, std::string& err) {
+    const OnDevice on_device(device_);
+    out = TreeDraft{};
+    if (T_in < 1 || tokens_in == nullptr) { err = "mtp draft_tree: invalid tokens"; return false; }
+    const int a = T_in - 1;
+    out.tokens[0] = tokens_in[a];
+    out.pos_offsets[0] = 0;
+    out.parent_slot[0] = -1;
+    out.attn_mask[0] = 0x01u;
+    out.probs[0] = 1.0f;
+    out.total_tokens = 1;
+
+    int32_t drafts_a[8] = {};
+    float probs_a[8] = {};
+    int n_a = 0;
+    const int lim_a = max_linear > 0 ? std::min(max_linear, 4) : 4;
+    if (!draft(T_in, tokens_in, pos0, a, drafts_a, err, probs_a, min_p, &n_a)) return false;
+    n_a = std::min(n_a, lim_a);
+    for (int j = 0; j < n_a; ++j) {
+        const int slot = 1 + j;
+        out.tokens[slot] = drafts_a[j];
+        out.pos_offsets[slot] = j + 1;
+        out.parent_slot[slot] = (j == 0 ? 0 : slot - 1);
+        out.attn_mask[slot] = out.attn_mask[out.parent_slot[slot]] | (1u << slot);
+        out.probs[slot] = probs_a ? probs_a[j] : 1.0f;
+    }
+    out.total_tokens = 1 + n_a;
+
+    out.branch_root_slot = 0;
+    out.branch_start = 0;
+    const int32_t tok2 = top2(0);
+    const float alt_p = alt_prob_;
+    const float tree_min_p = [] {
+        const char* v = std::getenv("STRATA_TREE_MIN_P");
+        return v ? (float) std::atof(v) : 0.06f;
+    }();
+
+    if (tok2 >= 0 && (n_a == 0 || tok2 != drafts_a[0]) && (alt_p >= tree_min_p || min_p <= 0.0f) && out.total_tokens < 8) {
+        const int b0 = out.total_tokens;
+        out.branch_start = b0;
+        out.tokens[b0] = tok2;
+        out.pos_offsets[b0] = 1;
+        out.parent_slot[b0] = 0;
+        out.attn_mask[b0] = out.attn_mask[0] | (1u << b0);
+        out.probs[b0] = alt_p > 0.0f ? alt_p : 0.5f;
+        out.alt_prob = alt_p;
+        out.total_tokens = b0 + 1;
+
+        const bool cp = coupled_active_;
+        const int64_t remaining_cells = st_.max_cells - (pos0 + a);
+        const int64_t NH = g_->n_head;
+        auto put = [&](int row, int64_t cell) {
+            h_step_[row * 4 + 0] = (int32_t) cell;
+            h_step_[row * 4 + 1] = (int32_t) (cell + 1);
+            h_step_[row * 4 + 2] = (int32_t) ((cell + 1) / 4);
+            h_step_[row * 4 + 3] = (int32_t) (cell + 1);
+            for (int64_t h = 0; h < NH; ++h) h_pos_[row * NH + h] = (int32_t) cell;
+        };
+        auto wait_step = [&](int j) {
+            uint32_t spins = 0;
+            while (((volatile int32_t*) h_out_)[j] < 0) {
+#if defined(_WIN32) || defined(__x86_64__)
+                _mm_pause();
+#endif
+                if ((++spins & 1023u) == 0 && cudaStreamQuery(cs_) != cudaErrorNotReady) break;
+            }
+        };
+
+        if (out.total_tokens < 8 && remaining_cells > 1 && capture_step(1, cp, err)) {
+            put(max_t_ + 0, coupled_draft_cell(pos0, a, 1));
+            h_tok_[0] = tok2;
+            strata::kernels::copy_i32_from_mapped(tok_, m_tok_, 1, cs_);
+            ((volatile int32_t*) h_out_)[0] = tok2;
+            ((volatile int32_t*) h_out_)[1] = -1;
+            ((volatile int32_t*) h_out_)[2] = -1;
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            if (cudaGraphLaunch(cp ? step_exec_c_[1] : step_exec_[1], cs_) == cudaSuccess) {
+                (void) cudaStreamQuery(cs_);
+                wait_step(1);
+                if (((volatile int32_t*) h_out_)[1] < 0) {
+                    strata_wddm_flush(cs_);
+                    (void) cudaStreamSynchronize(cs_);
+                }
+                const int32_t tok_b1 = ((volatile int32_t*) h_out_)[1];
+                const float prob_b1 = ((volatile float*) h_prob_)[1];
+                if (tok_b1 >= 0 && (min_p <= 0.0f || prob_b1 >= min_p)) {
+                    const int b1 = b0 + 1;
+                    out.tokens[b1] = tok_b1;
+                    out.pos_offsets[b1] = 2;
+                    out.parent_slot[b1] = b0;
+                    out.attn_mask[b1] = out.attn_mask[b0] | (1u << b1);
+                    out.probs[b1] = prob_b1 > 0.0f ? prob_b1 : 0.5f;
+                    out.total_tokens = b1 + 1;
+
+                    if (out.total_tokens < 8 && remaining_cells > 2 && capture_step(2, cp, err)) {
+                        put(max_t_ + 1, coupled_draft_cell(pos0, a, 2));
+                        ((volatile int32_t*) h_out_)[2] = -1;
+                        std::atomic_thread_fence(std::memory_order_seq_cst);
+                        if (cudaGraphLaunch(cp ? step_exec_c_[2] : step_exec_[2], cs_) == cudaSuccess) {
+                            (void) cudaStreamQuery(cs_);
+                            wait_step(2);
+                            if (((volatile int32_t*) h_out_)[2] < 0) {
+                                strata_wddm_flush(cs_);
+                                (void) cudaStreamSynchronize(cs_);
+                            }
+                            const int32_t tok_b2 = ((volatile int32_t*) h_out_)[2];
+                            const float prob_b2 = ((volatile float*) h_prob_)[2];
+                            if (tok_b2 >= 0 && (min_p <= 0.0f || prob_b2 >= min_p)) {
+                                const int b2 = b0 + 2;
+                                out.tokens[b2] = tok_b2;
+                                out.pos_offsets[b2] = 3;
+                                out.parent_slot[b2] = b1;
+                                out.attn_mask[b2] = out.attn_mask[b1] | (1u << b2);
+                                out.probs[b2] = prob_b2 > 0.0f ? prob_b2 : 0.5f;
+                                out.total_tokens = b2 + 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return true;
 }
 
 }  // namespace strata::core

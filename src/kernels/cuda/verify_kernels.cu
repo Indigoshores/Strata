@@ -1655,4 +1655,241 @@ bool pdl_launch_ok(const void* kernel, cudaStream_t stream) {
 }
 #endif
 
+// ==================== WDDM Compute Copy & Tree MTP Kernels ====================
+
+namespace {
+__global__ void compute_copy_d2d_kernel(uint4* __restrict__ dst, const uint4* __restrict__ src, size_t n16) {
+    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n16; i += (size_t) gridDim.x * blockDim.x) {
+        dst[i] = src[i];
+    }
+}
+__global__ void compute_copy_d2d_tail_kernel(uint8_t* __restrict__ dst, const uint8_t* __restrict__ src, size_t n) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = src[i];
+}
+
+__global__ void compact_tree_slots_kernel(float* __restrict__ dst, const float* __restrict__ src,
+                                          int64_t stride, const int32_t* __restrict__ accepted_slots, int n_keep) {
+    const int i = blockIdx.y;
+    if (i >= n_keep) return;
+    const int slot = accepted_slots[i];
+    if (slot < 0 || slot == i) return;
+    const float* s = src + (size_t) slot * stride;
+    float* d = dst + (size_t) i * stride;
+    for (int64_t j = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; j < stride; j += (int64_t) gridDim.x * blockDim.x) {
+        d[j] = s[j];
+    }
+}
+
+__global__ void compact_tree_gdn_layers_kernel(float* __restrict__ qkv, float* __restrict__ h, float* __restrict__ gate,
+                                               float* __restrict__ beta, int C, int HV, int MT, int n_layers,
+                                               const int32_t* __restrict__ accepted_slots, int n_keep) {
+    const int l = blockIdx.z;
+    const int i = blockIdx.y;
+    if (l >= n_layers || i >= n_keep) return;
+    const int slot = accepted_slots[i];
+    if (slot < 0 || slot == i) return;
+
+    float* qkv_l = qkv + (size_t) l * MT * C;
+    float* h_l = h + (size_t) l * MT * C;
+    for (int c = blockIdx.x * blockDim.x + threadIdx.x; c < C; c += gridDim.x * blockDim.x) {
+        qkv_l[i * C + c] = qkv_l[slot * C + c];
+        h_l[i * C + c] = h_l[slot * C + c];
+    }
+    if (blockIdx.x == 0) {
+        float* gate_l = gate + (size_t) l * MT * HV;
+        float* beta_l = beta + (size_t) l * MT * HV;
+        for (int v = threadIdx.x; v < HV; v += blockDim.x) {
+            gate_l[i * HV + v] = gate_l[slot * HV + v];
+            beta_l[i * HV + v] = beta_l[slot * HV + v];
+        }
+    }
+}
+
+__global__ void compact_tree_qsa_indexer_kernel(float* __restrict__ idx_raw, int ID, int MT, int n_layers,
+                                                const int32_t* __restrict__ accepted_slots, int n_keep) {
+    const int l = blockIdx.z;
+    const int i = blockIdx.y;
+    if (l >= n_layers || i >= n_keep) return;
+    const int slot = accepted_slots[i];
+    if (slot < 0 || slot == i) return;
+    float* idx_l = idx_raw + (size_t) l * MT * ID;
+    for (int d = blockIdx.x * blockDim.x + threadIdx.x; d < ID; d += gridDim.x * blockDim.x) {
+        idx_l[i * ID + d] = idx_l[slot * ID + d];
+    }
+}
+
+template <bool ALL_OUT, bool Q>
+__global__ void __launch_bounds__(S * RG) gdn_step_norm_tree_kernel(float* __restrict__ state,
+                                                                    const float* __restrict__ hbuf, int C,
+                                                                    const float* __restrict__ gate,
+                                                                    const float* __restrict__ beta,
+                                                                    const float* __restrict__ z,
+                                                                    const float* __restrict__ gamma, float eps,
+                                                                    float* __restrict__ y, int h_k, int h_v, int T,
+                                                                    const int32_t* __restrict__ parent_slot,
+                                                                    int t_out_begin, GdnQ81* __restrict__ xq) {
+    __shared__ float sk[2][S], sq[2][S];
+    __shared__ float red_kv[RG][S];
+    __shared__ float red_o[RG][S];
+    __shared__ float wsum[S / 32];
+    const int head = blockIdx.x;
+    const int col = threadIdx.x;
+    const int rg = threadIdx.y;
+    const int qh = head % h_k;
+    const int qk = S * h_k;
+    const int value_dim = S * h_v;
+    const int n = T;
+    if (n > 0) {
+        if (rg == 0) sk[0][col] = hbuf[qk + qh * S + col];
+        else if (rg == 1 && (ALL_OUT || 0 >= t_out_begin)) sq[0][col] = hbuf[qh * S + col];
+    }
+    const float gam = (rg == 0) ? gamma[col] : 0.0f;
+    float s[RPG];
+    float s_fork[RPG];
+    float* base = state + ((size_t) (rg * RPG) * h_v + head) * S + col;
+    const size_t row_stride = (size_t) h_v * S;
+#pragma unroll
+    for (int r = 0; r < RPG; ++r) s[r] = ALL_OUT ? __ldg(&base[r * row_stride]) : base[r * row_stride];
+    for (int t = 0; t < n; ++t) {
+        if (parent_slot != nullptr && t > 0) {
+            const int p = parent_slot[t];
+            if (p == 0 && parent_slot[t - 1] != 0) {
+#pragma unroll
+                for (int r = 0; r < RPG; ++r) s[r] = s_fork[r];
+            }
+        }
+        const int cur = t & 1, nxt = (t + 1) & 1;
+        const float* ht = hbuf + (size_t) t * C;
+        const bool need_out = ALL_OUT || (t >= t_out_begin);
+        __syncthreads();
+        if (t + 1 < n) {
+            const float* ht_next = ht + C;
+            const bool need_next = ALL_OUT || (t + 1 >= t_out_begin);
+            if (rg == 0) sk[nxt][col] = ht_next[qk + qh * S + col];
+            else if (rg == 1 && need_next) sq[nxt][col] = ht_next[qh * S + col];
+        }
+        const float g = __expf(gate[(size_t) t * h_v + head]);
+        float kv = 0.0f;
+#pragma unroll
+        for (int r = 0; r < RPG; ++r) kv = fmaf(s[r], sk[cur][rg * RPG + r], kv);
+        red_kv[rg][col] = kv;
+        __syncthreads();
+        const float kv_col = red_kv[0][col] + red_kv[1][col] + red_kv[2][col] + red_kv[3][col];
+        const float delta = (ht[2 * qk + head * S + col] - g * kv_col) * beta[(size_t) t * h_v + head];
+        if (!need_out) {
+#pragma unroll
+            for (int r = 0; r < RPG; ++r) s[r] = fmaf(g, s[r], sk[cur][rg * RPG + r] * delta);
+            if (t == 0) {
+#pragma unroll
+                for (int r = 0; r < RPG; ++r) s_fork[r] = s[r];
+            }
+            continue;
+        }
+        float o = 0.0f;
+#pragma unroll
+        for (int r = 0; r < RPG; ++r) {
+            s[r] = fmaf(g, s[r], sk[cur][rg * RPG + r] * delta);
+            o = fmaf(s[r], sq[cur][rg * RPG + r], o);
+        }
+        if (t == 0) {
+#pragma unroll
+            for (int r = 0; r < RPG; ++r) s_fork[r] = s[r];
+        }
+        red_o[rg][col] = o;
+        __syncthreads();
+        float oc = 0.0f, sq_part = 0.0f;
+        if (rg == 0) {
+            oc = (red_o[0][col] + red_o[1][col] + red_o[2][col] + red_o[3][col]) * rsqrtf((float) S);
+            sq_part = oc * oc;
+        }
+        for (int o2 = 16; o2 > 0; o2 >>= 1) sq_part += __shfl_xor_sync(0xffffffffu, sq_part, o2);
+        if (rg == 0 && (col & 31) == 0) wsum[col >> 5] = sq_part;
+        __syncthreads();
+        if (rg == 0) {
+            const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
+            const float scale = rsqrtf(ss / (float) S + eps);
+            const float zz = z[(size_t) t * value_dim + head * S + col];
+            const float yv = oc * scale * gam * (1.0f / (1.0f + __expf(-zz)));
+            y[(size_t) t * value_dim + head * S + col] = yv;
+            if constexpr (Q) gdn_q8_1_store(xq, (size_t) (t - t_out_begin) * value_dim + head * S + col, yv);
+        }
+    }
+}
+}  // namespace
+
+void compute_copy_d2d(void* dst, const void* src, size_t bytes, void* stream) {
+    if (bytes == 0 || dst == src || dst == nullptr || src == nullptr) return;
+    const size_t n16 = bytes / 16;
+    if (n16 > 0) {
+        const unsigned blocks = (unsigned) std::min<size_t>((n16 + 255) / 256, 64);
+        compute_copy_d2d_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>((uint4*) dst, (const uint4*) src, n16);
+    }
+    const size_t rem = bytes % 16;
+    if (rem > 0) {
+        compute_copy_d2d_tail_kernel<<<1, 16, 0, (cudaStream_t) stream>>>((uint8_t*) dst + n16 * 16,
+                                                                          (const uint8_t*) src + n16 * 16, rem);
+    }
+    check("compute_copy_d2d");
+}
+
+bool wddm_copy_kernel_on() {
+#if defined(_WIN32)
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_WDDM_COPY_KERNEL");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    return on;
+#else
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_WDDM_COPY_KERNEL");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    return on;
+#endif
+}
+
+void compact_tree_slots(float* dst, const float* src, int64_t stride, const int32_t* accepted_slots, int n_keep,
+                        void* stream) {
+    if (n_keep <= 0 || stride <= 0 || dst == nullptr || src == nullptr || accepted_slots == nullptr) return;
+    const unsigned blocks = (unsigned) std::min<int64_t>((stride + 255) / 256, 64);
+    compact_tree_slots_kernel<<<dim3(blocks, (unsigned) n_keep), 256, 0, (cudaStream_t) stream>>>(
+        dst, src, stride, accepted_slots, n_keep);
+    check("compact_tree_slots");
+}
+
+void compact_tree_gdn_layers(float* qkv, float* h, float* gate, float* beta, int C, int HV, int MT, int n_layers,
+                             const int32_t* accepted_slots, int n_keep, void* stream) {
+    if (n_layers <= 0 || n_keep <= 0 || C <= 0 || HV <= 0 || accepted_slots == nullptr) return;
+    const unsigned blocks = (unsigned) std::min<int>((C + 255) / 256, 64);
+    compact_tree_gdn_layers_kernel<<<dim3(blocks, (unsigned) n_keep, (unsigned) n_layers), 256, 0,
+                                     (cudaStream_t) stream>>>(qkv, h, gate, beta, C, HV, MT, n_layers,
+                                                              accepted_slots, n_keep);
+    check("compact_tree_gdn_layers");
+}
+
+void compact_tree_qsa_indexer(float* idx_raw, int ID, int MT, int n_layers, const int32_t* accepted_slots, int n_keep,
+                              void* stream) {
+    if (n_layers <= 0 || n_keep <= 0 || ID <= 0 || accepted_slots == nullptr) return;
+    const unsigned blocks = (unsigned) std::min<int>((ID + 255) / 256, 64);
+    compact_tree_qsa_indexer_kernel<<<dim3(blocks, (unsigned) n_keep, (unsigned) n_layers), 256, 0,
+                                      (cudaStream_t) stream>>>(idx_raw, ID, MT, n_layers, accepted_slots, n_keep);
+    check("compact_tree_qsa_indexer");
+}
+
+void gdn_step_norm_tree(float* state, const float* h, int conv_channels, const float* gate, const float* beta,
+                        const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int n_tok,
+                        const int32_t* parent_slot, void* stream, int t_out_begin, void* xq_out) {
+    GdnQ81* const xq = static_cast<GdnQ81*>(xq_out);
+    const dim3 g1((unsigned) h_v), b1(S, RG);
+    if (xq && t_out_begin < n_tok) {
+        gdn_step_norm_tree_kernel<true, true><<<g1, b1, 0, (cudaStream_t) stream>>>(
+            state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, parent_slot, t_out_begin, xq);
+    } else {
+        gdn_step_norm_tree_kernel<true, false><<<g1, b1, 0, (cudaStream_t) stream>>>(
+            state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, parent_slot, t_out_begin, nullptr);
+    }
+    check("gdn_step_norm_tree");
+}
+
 }  // namespace strata::kernels
