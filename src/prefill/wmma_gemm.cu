@@ -39,7 +39,7 @@
 using v8fp32 = float __attribute__((ext_vector_type(8)));
 
 // Does the CURRENT device run the gfx11 WMMA kernels of this file?  Exactly the targets whose intrinsics are selected
-// below (gfx1100 / 1101 / 1102 / 1150 / 1151): a gfx11 part outside the list (gfx1103, gfx1152) has no device code
+// below (gfx1100 / 1101 / 1102 / 1103 / 1150 / 1151): a gfx11 part outside the list (gfx1152) has no device code
 // here, so it takes the hipBLASLt / hipBLAS paths instead of running a kernel that is not there.  Cached per device
 // (hipGetDeviceProperties is not cheap, and a mixed-GPU box has more than one answer).
 static bool strata_wmma_gfx11_device() {
@@ -63,7 +63,7 @@ template <>
 struct WmmaTraits<_Float16> {
     using vec_t = _Float16 __attribute__((ext_vector_type(16)));
     __device__ static inline v8fp32 mma(vec_t a, vec_t b, v8fp32 c) {
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1150__) || defined(__gfx1151__)
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__)
         return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
 #else
         (void) a; (void) b; (void) c;
@@ -76,7 +76,7 @@ template <>
 struct WmmaTraits<__bf16> {
     using vec_t = __bf16 __attribute__((ext_vector_type(16)));
     __device__ static inline v8fp32 mma(vec_t a, vec_t b, v8fp32 c) {
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1150__) || defined(__gfx1151__)
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__)
         return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, c);
 #else
         (void) a; (void) b; (void) c;
@@ -321,7 +321,7 @@ template <int BN, int WN>
 __global__ void __launch_bounds__(256) kernel(const _Float16* __restrict__ X, const _Float16* __restrict__ W,
                                               float* __restrict__ Y, int M, int N, int K, int ldy, int accumulate,
                                               int ldx, int ldw) {
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1150__) || defined(__gfx1151__)
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__)
     constexpr int TN = WN / 16, NB = BN / 64;
     __shared__ __align__(16) _Float16 sA[2][BM][LDK];
     __shared__ __align__(16) _Float16 sB[2][BN][LDK];
@@ -398,7 +398,7 @@ __global__ void __launch_bounds__(256) kernel(const _Float16* __restrict__ X, co
 __global__ void __launch_bounds__(256) kernel_bk64(const _Float16* __restrict__ X, const _Float16* __restrict__ W,
                                                    float* __restrict__ Y, int M, int N, int K, int ldy, int accumulate,
                                                    int ldx, int ldw) {
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1150__) || defined(__gfx1151__)
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__)
     constexpr int BN = 256, WN = 64, BK64 = 64, LDK64 = BK64 + 8;
     __shared__ __align__(16) _Float16 sA[BM][LDK64];
     __shared__ __align__(16) _Float16 sB[BN][LDK64];
@@ -493,7 +493,7 @@ __global__ void __launch_bounds__(256) kernel_hcdown(const uint16_t* __restrict_
                                                      const uint16_t* __restrict__ Wd, const uint16_t* __restrict__ Wi,
                                                      int nd, int ni, float* __restrict__ lo, float* __restrict__ inj,
                                                      int M, int K) {
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1150__) || defined(__gfx1151__)
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__)
     constexpr int BN = 128, WN = 32, TN = 2, BK64 = 64, LDK64 = BK64 + 8;
     __shared__ __align__(16) uint16_t sA[BM][LDK64];
     __shared__ __align__(16) uint16_t sB[BN][LDK64];
@@ -586,7 +586,7 @@ __device__ __forceinline__ hb16 hx_frag(const uint16_t* p) {
 }
 __global__ void __launch_bounds__(HX_NT) kernel_hcd_exact(const uint16_t* __restrict__ X, int ldx,
                                                           const uint16_t* __restrict__ W, float* __restrict__ Y, int M) {
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1150__) || defined(__gfx1151__)
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__)
     constexpr int K = HX_K, BN = HX_BN, BMT = HX_BM, BK = HX_BK, NT = HX_NT;
     __shared__ __align__(16) uint16_t sA[BMT][HX_LDK];
     __shared__ __align__(16) uint16_t sB[BN][HX_LDK];
@@ -707,6 +707,309 @@ bool strata_pf_gemm_f16_ld(const uint16_t* X, int64_t ldx, const uint16_t* W, in
     return hipGetLastError() == hipSuccess;
 }
 
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__)
+typedef int q8_nw_i4 __attribute__((ext_vector_type(4)));
+typedef int q8_nw_i8 __attribute__((ext_vector_type(8)));
+typedef q8_nw_i4 q8_nw_ab;
+__device__ __forceinline__ q8_nw_ab q8_nw_v(uint4 v) { return q8_nw_ab{(int) v.x, (int) v.y, (int) v.z, (int) v.w}; }
+__device__ __forceinline__ q8_nw_i8 q8_nw_wmma(q8_nw_ab a, q8_nw_ab b, q8_nw_i8 c) {
+    return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a, true, b, c, false);
+}
+#endif
+constexpr int Q8_MAGIC = 0x4B400000;
+constexpr float Q8_MAGICF = 12582912.0f;
+
+__device__ __forceinline__ float cvt_x16_to_f32(uint16_t v, bool is_f16) {
+    return is_f16 ? __half2float(__ushort_as_half(v)) : __uint_as_float((uint32_t) v << 16);
+}
+
+__global__ void __launch_bounds__(128) gemm_wmma_q8_0_64x64_4w(
+    const void* __restrict__ X, bool x_is_f16, int64_t ldx,
+    const void* __restrict__ W_q8_0, float* __restrict__ Y,
+    int64_t T, int64_t N, int64_t K, int64_t ldy) {
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__)
+    const int m_tile = blockIdx.y * 64;
+    const int n_tile = blockIdx.x * 64;
+    if (m_tile >= T || n_tile >= N) return;
+
+    const int tid = threadIdx.x;   // 0..127
+    const int wave_id = tid >> 5;  // 0..3
+    const int lane = tid & 31;     // 0..31
+    const int lane_lo = lane & 15; // 0..15
+    const int lane_hi = lane >> 4; // 0 or 1
+
+    v8fp32 acc[4] = {{0}, {0}, {0}, {0}};
+
+    alignas(16) __shared__ float s_dw[2][64];
+    alignas(16) __shared__ uint4 s_wk0[2][64];
+    alignas(16) __shared__ uint4 s_wk1[2][64];
+    alignas(16) __shared__ float s_dx[4][16];
+
+    const size_t row_stride = (size_t) (K / 32) * 34;
+    const int row_in_tile = tid >> 1;
+    const int actual_n = n_tile + row_in_tile;
+
+    auto load_w = [&](int buf, int k_tile) {
+        if ((tid & 1) == 0) {
+            float dw = 0.0f;
+            uint4 wk0 = make_uint4(0, 0, 0, 0);
+            if (actual_n < N && k_tile < K) {
+                const uint8_t* ptr = reinterpret_cast<const uint8_t*>(W_q8_0) + (size_t) actual_n * row_stride + (size_t) (k_tile / 32) * 34;
+                uint16_t d_raw = *reinterpret_cast<const uint16_t*>(ptr);
+                dw = __half2float(__ushort_as_half(d_raw));
+                const uint16_t* p16 = reinterpret_cast<const uint16_t*>(ptr + 2);
+                wk0.x = (uint32_t) p16[0] | ((uint32_t) p16[1] << 16);
+                wk0.y = (uint32_t) p16[2] | ((uint32_t) p16[3] << 16);
+                wk0.z = (uint32_t) p16[4] | ((uint32_t) p16[5] << 16);
+                wk0.w = (uint32_t) p16[6] | ((uint32_t) p16[7] << 16);
+            }
+            s_dw[buf][row_in_tile] = dw;
+            s_wk0[buf][row_in_tile] = wk0;
+        } else {
+            uint4 wk1 = make_uint4(0, 0, 0, 0);
+            if (actual_n < N && k_tile < K) {
+                const uint8_t* ptr = reinterpret_cast<const uint8_t*>(W_q8_0) + (size_t) actual_n * row_stride + (size_t) (k_tile / 32) * 34;
+                const uint16_t* p16 = reinterpret_cast<const uint16_t*>(ptr + 18);
+                wk1.x = (uint32_t) p16[0] | ((uint32_t) p16[1] << 16);
+                wk1.y = (uint32_t) p16[2] | ((uint32_t) p16[3] << 16);
+                wk1.z = (uint32_t) p16[4] | ((uint32_t) p16[5] << 16);
+                wk1.w = (uint32_t) p16[6] | ((uint32_t) p16[7] << 16);
+            }
+            s_wk1[buf][row_in_tile] = wk1;
+        }
+    };
+
+    load_w(0, 0);
+    __syncthreads();
+    int cur_buf = 0;
+
+    for (int k_tile = 0; k_tile < K; k_tile += 32) {
+        const int next_buf = 1 - cur_buf;
+        const int k_next = k_tile + 32;
+        if (k_next < K) load_w(next_buf, k_next);
+
+        const int m_row = m_tile + wave_id * 16 + lane_lo;
+        const int k_off = k_tile + lane_hi * 16;
+        float vals[16];
+        float amax = 0.0f;
+        if (m_row < T && k_off < K) {
+            const uint16_t* p = reinterpret_cast<const uint16_t*>(X) + (size_t) m_row * ldx + k_off;
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                float v = cvt_x16_to_f32(p[i], x_is_f16);
+                vals[i] = v;
+                amax = fmaxf(amax, fabsf(v));
+            }
+        } else {
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) vals[i] = 0.0f;
+        }
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 16));
+        const float dx = amax / 127.0f;
+        const float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+        if (lane_hi == 0) s_dx[wave_id][lane_lo] = dx;
+
+        alignas(16) int8_t q_bytes[16];
+        #pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            q_bytes[i] = (int8_t) __float2int_rn(vals[i] * inv);
+        }
+        uint4 q_frag;
+        __builtin_memcpy(&q_frag, q_bytes, sizeof(uint4));
+
+        const q8_nw_ab a0 = {
+            __shfl_sync(0xffffffffu, (int) q_frag.x, lane_lo),
+            __shfl_sync(0xffffffffu, (int) q_frag.y, lane_lo),
+            __shfl_sync(0xffffffffu, (int) q_frag.z, lane_lo),
+            __shfl_sync(0xffffffffu, (int) q_frag.w, lane_lo)
+        };
+        const q8_nw_ab a1 = {
+            __shfl_sync(0xffffffffu, (int) q_frag.x, lane_lo + 16),
+            __shfl_sync(0xffffffffu, (int) q_frag.y, lane_lo + 16),
+            __shfl_sync(0xffffffffu, (int) q_frag.z, lane_lo + 16),
+            __shfl_sync(0xffffffffu, (int) q_frag.w, lane_lo + 16)
+        };
+
+        #pragma unroll
+        for (int sub = 0; sub < 4; ++sub) {
+            const q8_nw_ab b0 = q8_nw_v(s_wk0[cur_buf][sub * 16 + lane_lo]);
+            const q8_nw_ab b1 = q8_nw_v(s_wk1[cur_buf][sub * 16 + lane_lo]);
+            const q8_nw_i8 m = q8_nw_i8{Q8_MAGIC, Q8_MAGIC, Q8_MAGIC, Q8_MAGIC, Q8_MAGIC, Q8_MAGIC, Q8_MAGIC, Q8_MAGIC};
+            const q8_nw_i8 d0 = q8_nw_wmma(a0, b0, m);
+            const q8_nw_i8 d1 = q8_nw_wmma(a1, b1, d0);
+            const float dw = s_dw[cur_buf][sub * 16 + lane_lo];
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const float dx_row = s_dx[wave_id][2 * i + lane_hi];
+                const float dot = __builtin_bit_cast(float, d1[i]) - Q8_MAGICF;
+                acc[sub][i] = fmaf(dx_row * dw, dot, acc[sub][i]);
+            }
+        }
+        __syncthreads();
+        cur_buf = next_buf;
+    }
+
+    #pragma unroll
+    for (int sub = 0; sub < 4; ++sub) {
+        const int out_n = n_tile + sub * 16 + lane_lo;
+        if (out_n < N) {
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int out_m = m_tile + wave_id * 16 + 2 * i + lane_hi;
+                if (out_m < T) {
+                    Y[(size_t) out_m * ldy + out_n] = acc[sub][i];
+                }
+            }
+        }
+    }
+#endif
+}
+
+__global__ void __launch_bounds__(32) gemm_wmma_q8_0_16x64_1w(
+    const void* __restrict__ X, bool x_is_f16, int64_t ldx,
+    const void* __restrict__ W_q8_0, float* __restrict__ Y,
+    int64_t T, int64_t N, int64_t K, int64_t ldy) {
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__)
+    const int n_tile = blockIdx.x * 64;
+    if (n_tile >= N) return;
+
+    const int tid = threadIdx.x;   // 0..31
+    const int lane_lo = tid & 15; // 0..15
+    const int lane_hi = tid >> 4; // 0 or 1
+
+    v8fp32 acc[4] = {{0}, {0}, {0}, {0}};
+
+    alignas(16) __shared__ float s_dw[64];
+    alignas(16) __shared__ uint4 s_wk0[64];
+    alignas(16) __shared__ uint4 s_wk1[64];
+    alignas(16) __shared__ float s_dx[16];
+
+    const size_t row_stride = (size_t) (K / 32) * 34;
+
+    for (int k_tile = 0; k_tile < K; k_tile += 32) {
+        #pragma unroll
+        for (int step = 0; step < 2; ++step) {
+            const int row_in_tile = tid + step * 32;
+            const int actual_n = n_tile + row_in_tile;
+            float dw = 0.0f;
+            uint4 wk0 = make_uint4(0, 0, 0, 0), wk1 = make_uint4(0, 0, 0, 0);
+            if (actual_n < N && k_tile < K) {
+                const uint8_t* ptr = reinterpret_cast<const uint8_t*>(W_q8_0) + (size_t) actual_n * row_stride + (size_t) (k_tile / 32) * 34;
+                uint16_t d_raw = *reinterpret_cast<const uint16_t*>(ptr);
+                dw = __half2float(__ushort_as_half(d_raw));
+                const uint16_t* p16_0 = reinterpret_cast<const uint16_t*>(ptr + 2);
+                wk0.x = (uint32_t) p16_0[0] | ((uint32_t) p16_0[1] << 16);
+                wk0.y = (uint32_t) p16_0[2] | ((uint32_t) p16_0[3] << 16);
+                wk0.z = (uint32_t) p16_0[4] | ((uint32_t) p16_0[5] << 16);
+                wk0.w = (uint32_t) p16_0[6] | ((uint32_t) p16_0[7] << 16);
+                const uint16_t* p16_1 = reinterpret_cast<const uint16_t*>(ptr + 18);
+                wk1.x = (uint32_t) p16_1[0] | ((uint32_t) p16_1[1] << 16);
+                wk1.y = (uint32_t) p16_1[2] | ((uint32_t) p16_1[3] << 16);
+                wk1.z = (uint32_t) p16_1[4] | ((uint32_t) p16_1[5] << 16);
+                wk1.w = (uint32_t) p16_1[6] | ((uint32_t) p16_1[7] << 16);
+            }
+            s_dw[row_in_tile] = dw;
+            s_wk0[row_in_tile] = wk0;
+            s_wk1[row_in_tile] = wk1;
+        }
+
+        const int m_row = lane_lo;
+        const int k_off = k_tile + lane_hi * 16;
+        float vals[16];
+        float amax = 0.0f;
+        if (m_row < T && k_off < K) {
+            const uint16_t* p = reinterpret_cast<const uint16_t*>(X) + (size_t) m_row * ldx + k_off;
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                float v = cvt_x16_to_f32(p[i], x_is_f16);
+                vals[i] = v;
+                amax = fmaxf(amax, fabsf(v));
+            }
+        } else {
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) vals[i] = 0.0f;
+        }
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 16));
+        const float dx = amax / 127.0f;
+        const float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+        if (lane_hi == 0) s_dx[lane_lo] = dx;
+
+        alignas(16) int8_t q_bytes[16];
+        #pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            q_bytes[i] = (int8_t) __float2int_rn(vals[i] * inv);
+        }
+        uint4 q_frag;
+        __builtin_memcpy(&q_frag, q_bytes, sizeof(uint4));
+
+        const q8_nw_ab a0 = {
+            __shfl_sync(0xffffffffu, (int) q_frag.x, lane_lo),
+            __shfl_sync(0xffffffffu, (int) q_frag.y, lane_lo),
+            __shfl_sync(0xffffffffu, (int) q_frag.z, lane_lo),
+            __shfl_sync(0xffffffffu, (int) q_frag.w, lane_lo)
+        };
+        const q8_nw_ab a1 = {
+            __shfl_sync(0xffffffffu, (int) q_frag.x, lane_lo + 16),
+            __shfl_sync(0xffffffffu, (int) q_frag.y, lane_lo + 16),
+            __shfl_sync(0xffffffffu, (int) q_frag.z, lane_lo + 16),
+            __shfl_sync(0xffffffffu, (int) q_frag.w, lane_lo + 16)
+        };
+
+        #pragma unroll
+        for (int sub = 0; sub < 4; ++sub) {
+            const q8_nw_ab b0 = q8_nw_v(s_wk0[sub * 16 + lane_lo]);
+            const q8_nw_ab b1 = q8_nw_v(s_wk1[sub * 16 + lane_lo]);
+            const q8_nw_i8 m = q8_nw_i8{Q8_MAGIC, Q8_MAGIC, Q8_MAGIC, Q8_MAGIC, Q8_MAGIC, Q8_MAGIC, Q8_MAGIC, Q8_MAGIC};
+            const q8_nw_i8 d0 = q8_nw_wmma(a0, b0, m);
+            const q8_nw_i8 d1 = q8_nw_wmma(a1, b1, d0);
+            const float dw = s_dw[sub * 16 + lane_lo];
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const float dx_row = s_dx[2 * i + lane_hi];
+                const float dot = __builtin_bit_cast(float, d1[i]) - Q8_MAGICF;
+                acc[sub][i] = fmaf(dx_row * dw, dot, acc[sub][i]);
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int sub = 0; sub < 4; ++sub) {
+        const int out_n = n_tile + sub * 16 + lane_lo;
+        if (out_n < N) {
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int out_m = 2 * i + lane_hi;
+                if (out_m < T) {
+                    Y[(size_t) out_m * ldy + out_n] = acc[sub][i];
+                }
+            }
+        }
+    }
+#endif
+}
+
+bool strata_wmma_gemm_q8_0(const void* X, bool x_is_f16, int64_t ldx,
+                           const void* W_q8_0, float* Y,
+                           int64_t T, int64_t N, int64_t K, int64_t ldy,
+                           void* stream) {
+    if (!X || !W_q8_0 || !Y || T <= 0 || N <= 0 || K <= 0 || K % 32 != 0 || N % 16 != 0) return false;
+    if (!strata_wmma_gfx11_device()) return false;
+    if (ldy <= 0) ldy = N;
+    if (ldx < K) return false;
+    hipStream_t s = static_cast<hipStream_t>(stream);
+    if (T >= 16) {
+        dim3 block(128);
+        dim3 grid((uint32_t)((N + 63) / 64), (uint32_t)((T + 63) / 64), 1);
+        gemm_wmma_q8_0_64x64_4w<<<grid, block, 0, s>>>(X, x_is_f16, ldx, W_q8_0, Y, T, N, K, ldy);
+    } else {
+        dim3 block(32);
+        dim3 grid((uint32_t)((N + 63) / 64), 1, 1);
+        gemm_wmma_q8_0_16x64_1w<<<grid, block, 0, s>>>(X, x_is_f16, ldx, W_q8_0, Y, T, N, K, ldy);
+    }
+    return hipGetLastError() == hipSuccess;
+}
+
 #else
 // Non-HIP / Non-GFX11 compilation fallback
 bool strata_pf_gemm_f16(const uint16_t*, const uint16_t*, float*, int64_t, int64_t, int64_t, int64_t, float, void*) {
@@ -734,4 +1037,10 @@ bool strata_wmma_gemm_bf16(const uint16_t*, const uint16_t*, float*,
                            void*) {
     return false;
 }
+
+bool strata_wmma_gemm_q8_0(const void*, bool, int64_t, const void*, float*,
+                           int64_t, int64_t, int64_t, int64_t, void*) {
+    return false;
+}
 #endif
+

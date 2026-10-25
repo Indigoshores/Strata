@@ -31,7 +31,9 @@ bool built();
 bool available();
 /// available(), unless STRATA_PF_FUSED=0 (read once): the Q2_0 pack's fused experts, on by default since 0.1.36.
 bool enabled();
-/// STRATA_PF_FUSED=1 given explicitly, and available(): the native IQ packs' fused kernels (opt-in).
+/// STRATA_PF_FUSED=1 given explicitly, and available(): the native IQ packs' fused kernels (opt-in).  On gfx12 (RDNA4)
+/// only the native kernels exist: available() / enabled() / requested() stay false there and
+/// native_supported() (moe_fused_iq.hpp) reads the same opt-in itself.
 bool requested();
 
 /// Bytes of `rows` activation rows of `cols` values (a multiple of 64) in the kernels' int8 form: per 64 values 64
@@ -47,13 +49,17 @@ void quantize_act(const float* x, int64_t rows, int64_t cols, void* xa, void* st
 /// group_bytes(n, n_expert)), `slot[i]` = the row of pair i (the row of the per-slot outputs the combine reads) and
 /// `src[row]` = its token (i / k).  The order of the rows within an expert is not fixed; no output depends on it.
 void group(const int32_t* ids, int64_t n, int k, int n_expert, void* scratch, int32_t* slot, int32_t* src,
-           void* stream);
+           void* stream, const float* w = nullptr, float* rw = nullptr);
 
 /// Experts [e0, e1) of one layer (e1 - e0 <= kMaxBatch); blob[e - e0]: the Strata Q2_0 blob of expert e on the
 /// device (16-byte aligned), read only for an expert with rows.
 struct Batch {
     int e0 = 0, e1 = 0;
+    const uint8_t* const* blob_dev = nullptr; // optional device array [e1 - e0]; allows e1 - e0 > kMaxBatch (e.g. 512)
     const uint8_t* blob[kMaxBatch] = {};
+    __host__ __device__ inline const uint8_t* at(int idx) const {
+        return blob_dev ? blob_dev[idx] : blob[idx];
+    }
 };
 /// The batch's products: gate/up from `xa` (quantize_act of the layer's input, [tokens][2560]) through the rows
 /// `src` of `group`, SwiGLU, H as int8 into `ha` (act_bytes(n, 640)), down into `dm` [n][2560] FP32 at the rows of

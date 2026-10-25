@@ -18,6 +18,9 @@
 // for the k of a half-block: mma k index 16h + 4t + j stands for weight (and activation) 16h + t + 4j.  The
 // activations are stored in it (perm32), and a lane's two B registers (h = 0 and 1) are adjacent: one 8-byte load.
 #include "strata/prefill/moe_fused.hpp"
+#include "strata/prefill/moe_tile_buckets.cuh"
+#include "strata/kernels/gfx_arch.hpp"
+#include "strata/core/emulate.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -66,16 +69,7 @@ __host__ __device__ __forceinline__ int act_pos(int k) {
 #endif
 }
 
-struct Tables {
-    int32_t *cnt, *off, *fill, *ts;      // per expert: rows, first row (E + 1), placement cursor, first tile (E + 1)
-    int2* tiles;                         // {expert, first row}, in expert order
-};
-size_t tiles_at(int n_expert) { return ((size_t) (4 * n_expert + 2) * 4 + 15) / 16 * 16; }
-Tables tables(void* scratch, int n_expert) {
-    int32_t* p = (int32_t*) scratch;
-    return {p, p + n_expert, p + 2 * n_expert + 1, p + 3 * n_expert + 1,
-            (int2*) ((uint8_t*) scratch + tiles_at(n_expert))};
-}
+
 
 // ---- activations: one warp per 64 values
 __global__ void quant_act_kernel(const float* __restrict__ x, int64_t nblk, uint8_t* __restrict__ xa) {
@@ -104,76 +98,7 @@ __global__ void quant_act_kernel(const float* __restrict__ x, int64_t nblk, uint
         *(float4*) (out + 64) = make_float4(a0 / 127.0f, -(MAGICF + (float) s0), a1 / 127.0f, -(MAGICF + (float) s1));
 }
 
-// ---- grouping: counts, offsets and tiles, placement
-__global__ void count_kernel(const int32_t* __restrict__ ids, int64_t n, int E, int32_t* __restrict__ cnt) {
-    extern __shared__ int32_t hist[];
-    for (int e = threadIdx.x; e < E; e += blockDim.x) hist[e] = 0;
-    __syncthreads();
-    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x) {
-        const int e = ids[i];
-        if ((unsigned) e < (unsigned) E) atomicAdd(&hist[e], 1);
-    }
-    __syncthreads();
-    for (int e = threadIdx.x; e < E; e += blockDim.x)
-        if (hist[e]) atomicAdd(&cnt[e], hist[e]);
-}
 
-// exclusive prefix sum over the block (blockDim a multiple of 32); *total = the block's sum
-__device__ int block_excl_sum(int v, int* total, int* sh) {
-    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5, nw = blockDim.x >> 5;
-    int x = v;
-#pragma unroll
-    for (int o = 1; o < 32; o <<= 1) {
-        const int y = __shfl_up_sync(0xffffffffu, x, o);
-        if (lane >= o) x += y;
-    }
-    if (lane == 31) sh[w] = x;
-    __syncthreads();
-    if (w == 0) {
-        int s = lane < nw ? sh[lane] : 0;
-#pragma unroll
-        for (int o = 1; o < 32; o <<= 1) {
-            const int y = __shfl_up_sync(0xffffffffu, s, o);
-            if (lane >= o) s += y;
-        }
-        sh[lane] = s;
-    }
-    __syncthreads();
-    const int r = x - v + (w > 0 ? sh[w - 1] : 0);
-    *total = sh[nw - 1];
-    __syncthreads();   // sh is reused by the next call
-    return r;
-}
-
-// one block, a thread per expert (E <= 1024)
-__global__ void scan_kernel(Tables tb, int E) {
-    __shared__ int sh[32];
-    const int e = threadIdx.x;
-    const int c = e < E ? tb.cnt[e] : 0, nt = (c + kTileRows - 1) / kTileRows;
-    int rows = 0, tiles = 0;
-    const int o = block_excl_sum(c, &rows, sh), to = block_excl_sum(nt, &tiles, sh);
-    if (e < E) {
-        tb.off[e] = o;
-        tb.fill[e] = o;
-        tb.ts[e] = to;
-        for (int i = 0; i < nt; ++i) tb.tiles[to + i] = make_int2(e, o + i * kTileRows);
-    }
-    if (e == 0) {
-        tb.off[E] = rows;
-        tb.ts[E] = tiles;
-    }
-}
-
-__global__ void place_kernel(const int32_t* __restrict__ ids, int64_t n, int k, int E, Tables tb,
-                             int32_t* __restrict__ slot, int32_t* __restrict__ src) {
-    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    const int e = ids[i];
-    if ((unsigned) e >= (unsigned) E) { slot[i] = 0; return; }   // (the router never writes one)
-    const int p = atomicAdd(&tb.fill[e], 1);
-    slot[i] = p;
-    src[p] = (int32_t) (i / k);
-}
 
 // ---- the expert products
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
@@ -193,6 +118,26 @@ __device__ __forceinline__ void mma_s8(int (&d)[4], const uint32_t (&a)[4], uint
         : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(0));
 }
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
+// Turing (STRATA_PF_FUSED_SM75): no cp.async - the stages are filled by plain copies (the same bytes; the barriers
+// around them stay) - and no m16n8k32 with s8 operands: it is four m8n8k16, rows g / g + 8 by k 0-15 / 16-31 (the
+// m16n8k32 fragments: a[0] / a[1] rows g / g + 8 at k 4 tig.., a[2] / a[3] the same at k 16 + 4 tig.., b0 / b1 the
+// two k halves).  The int32 sums are exact in any order: the same d as the sm_80 instruction.
+__device__ __forceinline__ void cp16(void* dst, const void* src) { *(uint4*) dst = __ldg((const uint4*) src); }
+__device__ __forceinline__ void cp4(void* dst, const void* src) { *(uint32_t*) dst = __ldg((const uint32_t*) src); }
+__device__ __forceinline__ void cp_commit() {}
+template <int N> __device__ __forceinline__ void cp_wait() {}
+__device__ __forceinline__ void mma8_s8(int& c0, int& c1, uint32_t a, uint32_t b) {
+    asm("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0,%1}, {%2}, {%3}, {%0,%1};\n"
+        : "+r"(c0), "+r"(c1) : "r"(a), "r"(b));
+}
+__device__ __forceinline__ void mma_s8(int (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+    d[0] = d[1] = d[2] = d[3] = 0;
+    mma8_s8(d[0], d[1], a[0], b0);
+    mma8_s8(d[0], d[1], a[2], b1);
+    mma8_s8(d[2], d[3], a[1], b0);
+    mma8_s8(d[2], d[3], a[3], b1);
+}
 #endif
 
 // One work item = (tile of up to 64 routed rows of expert e, a block of 256 weight rows); a persistent grid walks
@@ -205,7 +150,7 @@ template <bool GU>
 __global__ void __launch_bounds__(THREADS, 1)
 expert_kernel(const Batch b, const Tables tb, const uint8_t* __restrict__ act, const int32_t* __restrict__ src,
               uint8_t* __restrict__ out, float* __restrict__ dm) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
     constexpr int NKB = GU ? 40 : 10;                 // 64-weight blocks along K
     constexpr int NFB = GU ? 5 : 10;                  // weight-row blocks per tile
     constexpr int CODE_LD = GU ? 640 : 160;           // code bytes per weight row
@@ -229,7 +174,7 @@ expert_kernel(const Batch b, const Tables tb, const uint8_t* __restrict__ act, c
     for (int w = blockIdx.x; w < nwork; w += gridDim.x) {
         const int2 tl = tb.tiles[t0 + w / NFB];
         const int fb = w % NFB, e = tl.x, row0 = tl.y, nrows = min(kTileRows, tb.off[e + 1] - row0);
-        const uint8_t* blob = b.blob[e - b.e0];
+        const uint8_t* blob = b.at(e - b.e0);
         const int rbase = fb * WROWS;
         __syncthreads();                                          // the previous item is done with the buffers
         if (tid < kTileRows) {
@@ -370,7 +315,7 @@ expert_kernel(const Batch b, const Tables tb, const uint8_t* __restrict__ act, c
 // No LDS staging: a wave reads its weight rows (16 B per row and 64-weight block) and its tile rows' activation
 // blocks (80 B) straight from global memory (L2: an expert's rows are read by every tile, a token's by every weight
 // block), one block ahead in registers; the work item's weight scales go to LDS once.
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1150__) || defined(__gfx1151__)
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__)
 #define STRATA_FUSED_W11 1
 #else
 #define STRATA_FUSED_W11 0
@@ -409,7 +354,7 @@ expert_w11_kernel(const Batch b, const Tables tb, const uint8_t* __restrict__ ac
     for (int w = blockIdx.x; w < nwork; w += gridDim.x) {
         const int2 tl = tb.tiles[t0 + w / NFB];
         const int fb = w % NFB, e = tl.x, row0 = tl.y, nrows = min(kTileRows, tb.off[e + 1] - row0);
-        const uint8_t* blob = b.blob[e - b.e0];
+        const uint8_t* blob = b.at(e - b.e0);
         const int rbase = fb * W_ROWS;
         __syncthreads();                                          // the previous item is done with srow / wsc / hs
         if (tid < kTileRows) {
@@ -607,7 +552,7 @@ const DevInfo& dev_info() {
         cudaDeviceProp prop;
         cudaDeviceGetAttribute(&d.sms, cudaDevAttrMultiProcessorCount, dev);
         hipFuncAttributes fa{};
-        if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess || std::strncmp(prop.gcnArchName, "gfx11", 5) != 0 ||
+        if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess || !strata::kernels::gfx_arch_is_gfx11_wmma(prop.gcnArchName) ||
             hipFuncGetAttributes(&fa, reinterpret_cast<const void*>(expert_w11_kernel<true>)) != hipSuccess) {
             cudaGetLastError();
             return d;
@@ -624,11 +569,13 @@ const DevInfo& dev_info() {
     cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
     cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
     cudaDeviceGetAttribute(&d.sms, cudaDevAttrMultiProcessorCount, dev);
-    d.cc = 10 * major + minor;
-    if (d.cc < 80) return d;
-    // the device code of this card's arch must have the kernels (a build without an sm_80+ target has an empty body)
+    d.cc = 10 * strata::cc_major_of(major) + strata::cc_minor_of(minor);   // STRATA_EMULATE_CC counts (tests)
+    // Turing (sm_75): the same kernels with plain copies and m8n8k16 MMAs, opt-in (STRATA_PF_FUSED_SM75=1)
+    static const bool sm75 = [] { const char* v = std::getenv("STRATA_PF_FUSED_SM75"); return v != nullptr && v[0] == '1'; }();
+    if (d.cc < 75 || (d.cc < 80 && !sm75)) { d.cc = d.cc < 80 ? 0 : d.cc; return d; }
+    // the device code of this card's arch must have the kernels (a build without an sm_75+ target has an empty body)
     cudaFuncAttributes fa{};
-    if (cudaFuncGetAttributes(&fa, expert_kernel<true>) != cudaSuccess || fa.ptxVersion < 80) {
+    if (cudaFuncGetAttributes(&fa, expert_kernel<true>) != cudaSuccess || fa.ptxVersion < (d.cc >= 80 ? 80 : 75)) {
         cudaGetLastError();
         d.cc = 0;
         return d;
@@ -648,7 +595,7 @@ const DevInfo& dev_info() {
 }  // namespace
 
 bool built() { return true; }
-bool available() { return dev_info().cc >= 80; }
+bool available() { return dev_info().cc >= 75; }
 // 0.1.36: on by default for the Q2_0 pack (+13-23% prompts on an RTX 5070; teacher-forced against the FP16 path as
 // close as MMQ at 8K and closer at 32K: phaseA-tests s18-tf); STRATA_PF_FUSED=0 keeps MMQ.  The native packs' kernels
 // (moe_fused_iq) stay opt-in: STRATA_PF_FUSED=1 (requested()).
@@ -673,7 +620,7 @@ bool requested() {
 
 size_t act_bytes(int64_t rows, int64_t cols) { return (size_t) rows * (size_t) (cols / 64) * AB; }
 size_t group_bytes(int64_t n, int n_expert) {
-    return tiles_at(n_expert) + ((size_t) (n + kTileRows - 1) / kTileRows + (size_t) n_expert) * sizeof(int2);
+    return bucket_scratch_bytes(n, n_expert);
 }
 
 void quantize_act(const float* x, int64_t rows, int64_t cols, void* xa, void* stream) {
@@ -684,20 +631,8 @@ void quantize_act(const float* x, int64_t rows, int64_t cols, void* xa, void* st
 }
 
 void group(const int32_t* ids, int64_t n, int k, int n_expert, void* scratch, int32_t* slot, int32_t* src,
-           void* stream) {
-    if (n_expert < 1 || n_expert > 1024) {
-        std::fprintf(stderr, "prefill fused experts: %d experts (the grouping takes 1 to 1024)\n", n_expert);
-        std::exit(1);
-    }
-    const cudaStream_t s = (cudaStream_t) stream;
-    const Tables tb = tables(scratch, n_expert);
-    ck(cudaMemsetAsync(tb.cnt, 0, (size_t) n_expert * 4, s), "group memset");
-    if (n > 0) {
-        const unsigned nb = std::min<unsigned>(blocks(n, 1024), 4u * (unsigned) std::max(dev_info().sms, 1));
-        count_kernel<<<nb, 1024, (size_t) n_expert * 4, s>>>(ids, n, n_expert, tb.cnt);
-    }
-    scan_kernel<<<1, (unsigned) ((n_expert + 31) / 32 * 32), 0, s>>>(tb, n_expert);
-    if (n > 0) place_kernel<<<blocks(n, 256), 256, 0, s>>>(ids, n, k, n_expert, tb, slot, src);
+           void* stream, const float* w, float* rw) {
+    group_bucketed(ids, n, k, n_expert, scratch, slot, src, (cudaStream_t) stream, 0, w, rw);
     ck(cudaGetLastError(), "group");
 }
 
@@ -706,7 +641,7 @@ void experts(const Batch& b, int n_expert, int64_t n, const void* scratch, const
     if (b.e1 <= b.e0 || n <= 0) return;
     const DevInfo& d = dev_info();
     const cudaStream_t s = (cudaStream_t) stream;
-    const Tables tb = tables(const_cast<void*>(scratch), n_expert);
+    const Tables tb = tables(const_cast<void*>(scratch), n_expert, n);
     // the most tiles the batch can have: every row in it, plus a partial tile per expert
     const int64_t tiles = (n + kTileRows - 1) / kTileRows + (b.e1 - b.e0);
 #if defined(__HIPCC__)

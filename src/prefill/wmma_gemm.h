@@ -45,3 +45,15 @@ bool strata_pf_gemm_f16_ld(const uint16_t* X, int64_t ldx, const uint16_t* W, in
 bool strata_wmma_gemm_bf16(const uint16_t* X, const uint16_t* W, float* Y,
                            int64_t T, int64_t N, int64_t K, int64_t ldy, float beta,
                            void* stream = nullptr);
+
+/// Zero-VRAM Direct Q8_0 INT8 WMMA GEMM for Hyper-Connections:
+/// Y[t, n] = sum_k X[t, k] * W[n, k]
+/// X: T x K row-major (leading dimension ldx), BF16 (x_is_f16=false) or FP16 (x_is_f16=true)
+/// W_q8_0: N x K row-major, Q8_0 format (each row has K / 32 contiguous 34-byte block_q8_0 blocks)
+/// Y: T x N row-major (leading dimension ldy), FP32
+/// Returns true if executed on WMMA, false if unsupported shape/parameters.
+bool strata_wmma_gemm_q8_0(const void* X, bool x_is_f16, int64_t ldx,
+                           const void* W_q8_0, float* Y,
+                           int64_t T, int64_t N, int64_t K, int64_t ldy,
+                           void* stream = nullptr);
+

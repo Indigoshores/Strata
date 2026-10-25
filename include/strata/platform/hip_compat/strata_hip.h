@@ -49,6 +49,7 @@
 #define cudaStreamCaptureStatusNone hipStreamCaptureStatusNone
 #define cudaStreamCaptureStatusActive hipStreamCaptureStatusActive
 #define cudaEventDisableTiming hipEventDisableTiming
+#define cudaEventBlockingSync hipEventBlockingSync
 #define cudaEventDefault hipEventDefault
 #define cudaHostAllocDefault hipHostMallocDefault
 #define cudaHostAllocPortable hipHostMallocPortable
@@ -96,6 +97,7 @@ inline hipError_t strata_device_get_attribute(int* v, hipDeviceAttribute_t a, in
 #define cudaDeviceSynchronize hipDeviceSynchronize
 #define cudaDeviceCanAccessPeer hipDeviceCanAccessPeer
 #define cudaDeviceEnablePeerAccess hipDeviceEnablePeerAccess
+#define cudaDeviceDisablePeerAccess hipDeviceDisablePeerAccess
 #define cudaDriverGetVersion hipDriverGetVersion
 #define cudaRuntimeGetVersion hipRuntimeGetVersion
 #define cudaSetDeviceFlags hipSetDeviceFlags
@@ -103,8 +105,27 @@ inline hipError_t strata_device_get_attribute(int* v, hipDeviceAttribute_t a, in
 #define cudaFree hipFree
 #define cudaMemGetInfo hipMemGetInfo
 #define cudaMemcpy hipMemcpy
+#if defined(_WIN32)
+extern "C" hipError_t strata_wddm_d2d_copy(void* dst, const void* src, size_t bytes, hipStream_t stream);
+
+inline hipError_t strata_hip_memcpy_async_compat(void* dst, const void* src, size_t bytes, hipMemcpyKind kind, hipStream_t stream = nullptr) {
+    if (kind == hipMemcpyDeviceToDevice && bytes > 0 && bytes <= (16ull << 20)) {
+        static const bool s_use_kernel = []() {
+            const char* env = std::getenv("STRATA_WDDM_COPY_KERNEL");
+            return env ? (std::atoi(env) != 0) : false;
+        }();
+        if (s_use_kernel) {
+            return strata_wddm_d2d_copy(dst, src, bytes, stream);
+        }
+    }
+    return hipMemcpyAsync(dst, src, bytes, kind, stream);
+}
+#define cudaMemcpyAsync strata_hip_memcpy_async_compat
+#else
 #define cudaMemcpyAsync hipMemcpyAsync
+#endif
 #define cudaMemcpyPeerAsync hipMemcpyPeerAsync
+#define cudaMemcpyPeer hipMemcpyPeer
 #define cudaMemcpy2DAsync hipMemcpy2DAsync
 #define cudaMemset hipMemset
 #define cudaMemsetAsync hipMemsetAsync
@@ -128,12 +149,28 @@ template <typename T> inline hipError_t strata_host_alloc(T** p, size_t bytes, u
 #define cudaStreamCreate hipStreamCreate
 #define cudaStreamCreateWithFlags hipStreamCreateWithFlags
 #define cudaStreamDestroy hipStreamDestroy
-#define cudaStreamSynchronize hipStreamSynchronize
 #define cudaStreamQuery hipStreamQuery
+#define cudaStreamIsCapturing hipStreamIsCapturing
+#define cudaStreamSynchronize hipStreamSynchronize
+inline void strata_wddm_flush(hipStream_t stream) {
+#if defined(_WIN32)
+    static const bool s_flush = []() {
+        const char* env = std::getenv("STRATA_WDDM_FLUSH");
+        return env ? (std::atoi(env) != 0) : true;
+    }();
+    if (s_flush && stream != nullptr) {
+        hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
+        if (hipStreamIsCapturing(stream, &capture) == hipSuccess && capture == hipStreamCaptureStatusNone) {
+            (void)hipStreamQuery(stream);
+        }
+    }
+#else
+    (void)stream;
+#endif
+}
 #define cudaStreamWaitEvent hipStreamWaitEvent
 #define cudaStreamBeginCapture hipStreamBeginCapture
 #define cudaStreamEndCapture hipStreamEndCapture
-#define cudaStreamIsCapturing hipStreamIsCapturing
 #define cudaLaunchHostFunc hipLaunchHostFunc
 #define cudaEventCreate hipEventCreate
 #define cudaEventCreateWithFlags hipEventCreateWithFlags
@@ -163,6 +200,7 @@ inline hipError_t cudaFuncSetAttribute(Kernel kernel, hipFuncAttribute attribute
     return hipFuncSetAttribute(reinterpret_cast<const void*>(kernel), attribute, value);
 }
 #define cudaMemcpyToSymbol(sym, src, ...) hipMemcpyToSymbol(HIP_SYMBOL(sym), src, __VA_ARGS__)
+#define cudaMemcpyFromSymbol(dst, sym, ...) hipMemcpyFromSymbol(dst, HIP_SYMBOL(sym), __VA_ARGS__)
 
 // CUDA 12 has a 3-argument cudaGraphInstantiate(exec, graph, flags) and the older 5-argument one; HIP spells
 // the first hipGraphInstantiateWithFlags.  Both are used in the tree.

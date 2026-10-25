@@ -19,10 +19,12 @@ void check(cudaError_t e, const char* what) {
 // A NaN pattern, not zero.  Zeros read from uninitialised memory are indistinguishable from real zeros in a
 // dequantized weight or a masked attention score, which is exactly the kind of wrong-but-plausible value the
 // Phase 1 harnesses kept catching.
+#if !defined(STRATA_GPU_METAL)
 __global__ void poison_kernel(float* p, uint64_t n_floats) {
     const uint64_t i = (uint64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n_floats) p[i] = __int_as_float(0x7fc00000);
 }
+#endif
 
 #if defined(STRATA_USE_HIP)
 #if !defined(STRATA_HIP_ARCHS)
@@ -81,6 +83,13 @@ int device_count() {
     }
     return count < 0 ? 0 : count;
 }
+
+// STRATA_PRIMARY_DEVICE: see the declaration in device.hpp.  0 = upstream's behavior (the runtime's first
+// visible device).  Set once, before any context exists, by generate.cpp's STRATA_PRIMARY_DEVICE handling.
+static int g_primary_device = 0;
+
+void set_primary_device(int ordinal) { g_primary_device = ordinal; }
+int primary_device() { return g_primary_device; }
 
 bool device_summary(int ordinal, std::string& name, std::string& detail) {
     cudaDeviceProp p{};
@@ -232,7 +241,7 @@ std::string gpu_arch_problem(int ordinal) {
 }
 
 std::string device_code_error() {
-#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906) || defined(STRATA_GPU_METAL)
     return "";   // gpu_arch_problem() checks the HIP architectures against STRATA_HIP_ARCHS, before this point
 #else
     // every .cu of the engine is compiled for the same CMAKE_CUDA_ARCHITECTURES, so this kernel stands for all
@@ -322,6 +331,12 @@ DeviceArena::DeviceArena(uint64_t bytes, int ordinal, bool poison)
     // One allocation for the whole region.  cudaMalloc of a large block is the thing that can fail late, so it
     // happens once, here, before anything depends on it.
     check(cudaMalloc(&base_, (size_t) bytes), "cudaMalloc");
+#if defined(STRATA_GPU_METAL)   // unified memory: the CPU writes the pattern through the allocation's CPU view
+    if (poison_) {
+        uint32_t* h = (uint32_t*) strata::gpu::host_view(base_);
+        for (uint64_t i = 0; i < bytes / sizeof(float); ++i) h[i] = 0x7fc00000u;
+    }
+#else
     if (poison_) {
         const int threads = 256;
         const uint64_t n = bytes / sizeof(float);
@@ -336,6 +351,7 @@ DeviceArena::DeviceArena(uint64_t bytes, int ordinal, bool poison)
         }
         check(cudaDeviceSynchronize(), "poison sync");
     }
+#endif
 }
 
 DeviceArena::~DeviceArena() {
@@ -360,5 +376,33 @@ void* DeviceArena::alloc(uint64_t bytes, uint64_t align) {
     used_ = start + bytes;
     return (char*) base_ + start;
 }
+
+#if defined(_WIN32)
+namespace {
+__global__ void wddm_copy_words_kernel(const uint32_t* __restrict__ src, uint32_t* __restrict__ dst, size_t n_words) {
+    const size_t i = (size_t)blockIdx.x * (size_t)blockDim.x + (size_t)threadIdx.x;
+    if (i < n_words) dst[i] = src[i];
+}
+__global__ void wddm_copy_bytes_kernel(const uint8_t* __restrict__ src, uint8_t* __restrict__ dst, size_t n_bytes) {
+    const size_t i = (size_t)blockIdx.x * (size_t)blockDim.x + (size_t)threadIdx.x;
+    if (i < n_bytes) dst[i] = src[i];
+}
+} // namespace
+
+extern "C" cudaError_t strata_wddm_d2d_copy(void* dst, const void* src, size_t bytes, cudaStream_t stream) {
+    if (bytes == 0) return cudaSuccess;
+    if ((bytes % 4 == 0) && (reinterpret_cast<uintptr_t>(src) % 4 == 0) && (reinterpret_cast<uintptr_t>(dst) % 4 == 0)) {
+        const size_t words = bytes / 4;
+        constexpr unsigned kThreads = 256;
+        const unsigned blocks = static_cast<unsigned>((words + kThreads - 1) / kThreads);
+        wddm_copy_words_kernel<<<blocks, kThreads, 0, stream>>>(static_cast<const uint32_t*>(src), static_cast<uint32_t*>(dst), words);
+    } else {
+        constexpr unsigned kThreads = 256;
+        const unsigned blocks = static_cast<unsigned>((bytes + kThreads - 1) / kThreads);
+        wddm_copy_bytes_kernel<<<blocks, kThreads, 0, stream>>>(static_cast<const uint8_t*>(src), static_cast<uint8_t*>(dst), bytes);
+    }
+    return cudaGetLastError();
+}
+#endif
 
 }  // namespace strata::core

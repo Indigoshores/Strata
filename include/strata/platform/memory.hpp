@@ -8,6 +8,8 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace strata::platform {
 
@@ -19,6 +21,11 @@ struct LockResult {
 
 /// Lock [p, p + bytes) into physical memory. Partial success is reported, not hidden.
 LockResult lock_resident(void* p, uint64_t bytes);
+
+/// Pin-by-need: lock several disjoint regions (the holes between the registered ranges of an arena).  The Windows
+/// working-set minimum is raised ONCE for the total (lock_resident per region would add its margin every time);
+/// stops at the first refusal and reports the bytes locked so far.  Undo each region with unlock_resident.
+LockResult lock_resident_ranges(const std::vector<std::pair<void*, uint64_t>>& regions);
 
 /// Undo lock_resident for the same region (best effort).
 void unlock_resident(void* p, uint64_t bytes);
@@ -60,6 +67,10 @@ bool read_ahead_enabled();
 void advise_willneed(const void* p, uint64_t bytes);
 /// The same for [offset, offset + bytes) of an open file.
 void advise_willneed(int fd, uint64_t offset, uint64_t bytes);
+
+/// Batched prefetch for multiple address ranges. On Windows, batches up to 128 page-aligned
+/// WIN32_MEMORY_RANGE_ENTRY items per PrefetchVirtualMemory syscall.
+void prefetch_ranges(const std::pair<const void*, size_t>* ranges, size_t count);
 
 /// What the OS says this process read from storage: `read_bytes` (/proc/self/io: bytes fetched from the block layer on
 /// its behalf, page faults on a mapping included, page-cache hits not) and `major_faults` (/proc/self/stat).  Linux

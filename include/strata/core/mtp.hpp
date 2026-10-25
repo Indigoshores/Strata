@@ -20,6 +20,7 @@
 #pragma once
 
 #include "strata/core/layer.hpp"
+#include "strata/core/pinned_ring.hpp"
 #include "strata/core/session.hpp"
 #include "strata/kernels/sampler.hpp"
 
@@ -32,6 +33,19 @@
 namespace strata::core {
 
 class NativeHead;
+
+/// STRATA_MTP_TREE=1: Top-2 branching 2x4 tree draft structure (8 tokens: root + 4 Branch A + 3 Branch B)
+struct TreeDraft {
+    int total_tokens = 0;
+    int branch_start = 0;
+    int branch_root_slot = 0;
+    int32_t tokens[8] = {};
+    int32_t pos_offsets[8] = {};
+    int32_t parent_slot[8] = {};
+    uint32_t attn_mask[8] = {};
+    float probs[8] = {};
+    float alt_prob = 0.0f;
+};
 
 class MtpDrafter {
 public:
@@ -46,6 +60,12 @@ public:
               int64_t window = 32768, const MtpDrafter* shared = nullptr);
     /// The prompt's length: prefill() skips the cells the attention window can never reach again.
     void set_prompt_len(int64_t n) { prompt_len_ = n; }
+    /// STRATA_ROUTE_RESIDENT_MTP=1 (EXPERIMENTAL, opt-in, changes the output): the draft layer's router is biased like
+    /// the verifier's STRATA_ROUTE_RESIDENT, with `res_row` (a device residency row of 512 experts: slot or -1) as the
+    /// table.  nullptr switches it off.
+    void set_route_resident(const int32_t* res_row, float margin, int lo, int hi) {
+        rr_res_ = res_row; rr_margin_ = margin; rr_lo_ = lo; rr_hi_ = hi;
+    }
     /// At most this many drafts per round (below max_t - 1): a window longer than the MTP's comes from elsewhere.
     void set_max_drafts(int k) { max_drafts_ = k; }
     /// --mtp-hnorm stream (opt-in; before the first draft or prefill): pre_fc_norm_hidden normalizes each
@@ -75,6 +95,7 @@ public:
     /// The main model's embedding and head, and the verify window's final residuals (T rows, hc*n_embd each).
     bool bind(const WeightTable& wt, const NativeHead* head, const float* window_R, std::string& err,
               const MtpDrafter* shared = nullptr);
+    void set_window_R(const float* window_R) { window_R_ = window_R; }
 
     /// Prompt cells [cell0, cell0 + n): residual rows `R_rows` (device, hc*n_embd each) and `next_tokens` (host,
     /// the token at position cell+1).  Runs in batches of up to max_t rows.  `sync` false: returns without waiting
@@ -84,6 +105,10 @@ public:
     /// --pipeline-windows: capture the prefill graphs and size its input records for windows of up to max_t rows now,
     /// so a later prefill(sync = false) of a window neither captures nor allocates (both wait for the device).
     bool prepare_prefill(std::string& err);
+    /// A prompt read beside running batch windows (STRATA_PIPED_CONCURRENT): the prompt pass's graphs captured and its
+    /// input records sized for chunks of up to n rows now, with nothing in flight.  On the read's thread a capture or
+    /// a free waits for the device, whose windows wait for the main thread's doorbell service (#31).
+    bool reserve_prefill(int64_t n, std::string& err);
     cudaStream_t stream() const { return cs_; }
 
     /// One round: catch-up over T cells from `p` (rows = the window's final residuals, `tokens` = the window's
@@ -95,6 +120,12 @@ public:
     /// The first round: one cell (`cell`) from `R_row` (device) and `token` -> T-1 drafts.
     bool draft_first(int T, const float* R_row, int32_t token, int64_t cell, int32_t* drafts, std::string& err,
                      float* probs = nullptr, float min_p = 0.0f, int* n_drafts = nullptr);
+
+    /// STRATA_MTP_TREE=1: Top-2 branching 2x4 tree drafting (up to 8 tokens total).
+    bool draft_tree(int T_in, const int32_t* tokens_in, int64_t pos0, int max_linear, float min_p, TreeDraft& out,
+                    std::string& err);
+    static bool mtp_tree_enabled();
+    static bool mtp_device_chain_enabled();
 
     /// COUPLED DRAFT SAMPLING (core/coupled_draft.hpp; STRATA_SPEC_COUPLED=1, set up by bind()): the request's
     /// sampling.  A sampled request (temperature > 0, not greedy) then drafts by SAMPLING with the target's chain and
@@ -138,6 +169,8 @@ public:
     const float* chain_prob() const { return chain_prob_; }
 
     double ms_draft = 0, ms_prefill = 0;
+    double ms_src = 0;      ///< the host time spent staging the source rows (a cross-card copy when the drafter is on another card)
+    int64_t n_src = 0;
     int64_t rounds = 0;
 
     /// E-9: the prompt path computes this layer's prompt K/V in batches (Prefill::draft_kv): its tensors, its K/V
@@ -206,6 +239,7 @@ private:
     void record_top2(int j);
     std::vector<int32_t> top2_, dvocab_host_;
     std::vector<float> lg_host_;
+    float alt_prob_ = 0.0f;
     // --pipeline-windows 2 (chain_launch)
     bool stage_source_R(int T, std::string& err);   ///< set_source_R's rows into the bound buffer
     bool force_on_ = false, chain_live_ = false;
@@ -221,6 +255,7 @@ private:
     cudaStream_t cs_ = nullptr;
     cudaGraphExec_t prefill_exec_[9] = {};
     cudaGraphExec_t prefill_dev_exec_[9] = {};
+    PinnedRing pf_ring_;          ///< #1996: the records above go up from a pinned slot, not from the pageable vector they are built in
     int32_t* pf_dev_ = nullptr;   ///< E-4: a prompt's rows' token / step / position records, uploaded at once
     int64_t pf_cap_ = 0;          ///< its capacity in ints
     cudaStream_t side_ = nullptr;                    // the shared expert's branch of the draft graphs (CUDA)
@@ -251,6 +286,9 @@ private:
     std::string rt_dir_;
     int64_t window_ = 0;        // attention over the last window_ cells (0 = every cell)
     int64_t prompt_len_ = 0;
+    const int32_t* rr_res_ = nullptr;
+    float rr_margin_ = 0.0f;
+    int rr_lo_ = 6, rr_hi_ = 9;
     float* probs_ = nullptr;
     uint8_t* arg_scratch_ = nullptr;   ///< argmax_rows' and row_top_prob_split's partials and counters
     uint8_t* top_scratch_ = nullptr;
@@ -259,6 +297,9 @@ private:
     float *Rin_ = nullptr, *R_ = nullptr, *emb_ = nullptr, *en_ = nullptr, *e2_ = nullptr, *hn_ = nullptr, *h2_ = nullptr;
     float *mixed_ = nullptr, *inj_ = nullptr, *inj2_ = nullptr, *lo_ = nullptr, *rs_ = nullptr, *bo_ = nullptr;
     float* xn_ = nullptr;
+    /// gr_read's scratch of the drafter's own (not the session's ss.block.gr: the last stage's verifier uses that one,
+    /// and with --pipeline-windows a chain and that stage's window can run on the card at once)
+    strata::kernels::GrWorkspace own_gr_;
     uint8_t* xq_ = nullptr;
     float *qfull_ = nullptr, *qcur_ = nullptr, *kcur_ = nullptr, *vcur_ = nullptr, *attn_ = nullptr, *attn32_ = nullptr;
     float* attn_scratch_ = nullptr;

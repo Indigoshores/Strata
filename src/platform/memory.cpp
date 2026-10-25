@@ -2,10 +2,19 @@
 #include "strata/platform/memory.hpp"
 
 #if defined(_WIN32)
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0602
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 #include <dxgi1_4.h>
+#include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #else
 #include <algorithm>
@@ -56,6 +65,49 @@ LockResult lock_resident(void* p, uint64_t bytes) {
     }
     r.ok = true;
     r.note = "locked " + std::to_string((unsigned long long) (bytes >> 20)) + " MiB via working-set minimum + VirtualLock";
+    return r;
+}
+
+LockResult lock_resident_ranges(const std::vector<std::pair<void*, uint64_t>>& regions) {
+    LockResult r;
+    uint64_t total = 0;
+    for (const auto& g : regions) total += g.second;
+    if (total == 0) { r.note = "nothing to lock"; return r; }
+    HANDLE self = GetCurrentProcess();
+    SIZE_T min_ws = 0, max_ws = 0;
+    DWORD flags = 0;
+    if (!GetProcessWorkingSetSizeEx(self, &min_ws, &max_ws, &flags)) {
+        r.note = "GetProcessWorkingSetSizeEx failed (error " + std::to_string(GetLastError()) + ")";
+        return r;
+    }
+    // same growth as lock_resident, but for the sum of the regions and with ONE margin
+    const SIZE_T margin = (SIZE_T) 512 << 20;
+    const SIZE_T new_min = min_ws + (SIZE_T) total + margin;
+    const SIZE_T new_max = max_ws > new_min + margin ? max_ws : new_min + margin;
+    if (!SetProcessWorkingSetSizeEx(self, new_min, new_max,
+                                    QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE)) {
+        r.note = "SetProcessWorkingSetSizeEx(" + std::to_string((unsigned long long) (new_min >> 20)) +
+                 " MiB) failed (error " + std::to_string(GetLastError()) + ")";
+        return r;
+    }
+    const uint64_t chunk = 1ull << 30;
+    for (const auto& g : regions) {
+        uint8_t* base = (uint8_t*) g.first;
+        for (uint64_t off = 0; off < g.second; off += chunk) {
+            const uint64_t n = g.second - off < chunk ? g.second - off : chunk;
+            if (!VirtualLock(base + off, (SIZE_T) n)) {
+                r.note = "VirtualLock stopped after " + std::to_string((unsigned long long) (r.locked_bytes >> 20)) +
+                         " of " + std::to_string((unsigned long long) (total >> 20)) + " MiB (error " +
+                         std::to_string(GetLastError()) + ")";
+                r.ok = r.locked_bytes > 0;
+                return r;
+            }
+            r.locked_bytes += n;
+        }
+    }
+    r.ok = true;
+    r.note = "locked " + std::to_string((unsigned long long) (total >> 20)) + " MiB in " +
+             std::to_string(regions.size()) + " regions via working-set minimum + VirtualLock";
     return r;
 }
 
@@ -114,8 +166,75 @@ uint64_t total_physical_memory() {
     return GlobalMemoryStatusEx(&ms) ? (uint64_t) ms.ullTotalPhys : 0;
 }
 
-bool read_ahead_enabled() { return false; }
-void advise_willneed(const void*, uint64_t) {}
+bool read_ahead_enabled() {
+    static const bool on = [] {
+        const char* wp = std::getenv("STRATA_WIN_PREFETCH");
+        if (wp != nullptr) return std::atoi(wp) != 0;
+        const char* ra = std::getenv("STRATA_READ_AHEAD");
+        if (ra != nullptr) return std::atoi(ra) != 0;
+        return true;
+    }();
+    return on;
+}
+
+void prefetch_ranges(const std::pair<const void*, size_t>* ranges, size_t count) {
+    if (ranges == nullptr || count == 0 || !read_ahead_enabled()) return;
+    HANDLE self = GetCurrentProcess();
+    constexpr size_t kBatchMax = 128;
+    constexpr size_t kMaxChunk = 256ull << 20; // 256 MiB max per entry
+    constexpr uintptr_t kPageSize = 4096;
+
+    using PFN_PrefetchVirtualMemory = BOOL (WINAPI *)(HANDLE, ULONG_PTR, PWIN32_MEMORY_RANGE_ENTRY, ULONG);
+    static PFN_PrefetchVirtualMemory fn_prefetch = [] {
+        HMODULE hKernel = GetModuleHandleW(L"kernel32.dll");
+        return hKernel ? reinterpret_cast<PFN_PrefetchVirtualMemory>(GetProcAddress(hKernel, "PrefetchVirtualMemory")) : nullptr;
+    }();
+    if (!fn_prefetch) return;
+
+    WIN32_MEMORY_RANGE_ENTRY entries[kBatchMax];
+    size_t n_entries = 0;
+
+    auto flush_batch = [&]() {
+        if (n_entries > 0) {
+            (void) fn_prefetch(self, static_cast<ULONG_PTR>(n_entries), entries, 0);
+            n_entries = 0;
+        }
+    };
+
+    for (size_t i = 0; i < count; ++i) {
+        const void* p = ranges[i].first;
+        size_t len = ranges[i].second;
+        if (p == nullptr || len == 0) continue;
+
+        uintptr_t addr = reinterpret_cast<uintptr_t>(p);
+        uintptr_t aligned_base = addr & ~(kPageSize - 1);
+        size_t offset_in_page = static_cast<size_t>(addr - aligned_base);
+        size_t aligned_len = ((len + offset_in_page + (kPageSize - 1)) / kPageSize) * kPageSize;
+
+        uintptr_t curr = aligned_base;
+        size_t rem = aligned_len;
+
+        while (rem > 0) {
+            size_t chunk = rem > kMaxChunk ? kMaxChunk : rem;
+            entries[n_entries].VirtualAddress = reinterpret_cast<PVOID>(curr);
+            entries[n_entries].NumberOfBytes = chunk;
+            ++n_entries;
+            if (n_entries == kBatchMax) {
+                flush_batch();
+            }
+            curr += chunk;
+            rem -= chunk;
+        }
+    }
+    flush_batch();
+}
+
+void advise_willneed(const void* p, uint64_t bytes) {
+    if (p == nullptr || bytes == 0 || !read_ahead_enabled()) return;
+    std::pair<const void*, size_t> r(p, static_cast<size_t>(bytes));
+    prefetch_ranges(&r, 1);
+}
+
 void advise_willneed(int, uint64_t, uint64_t) {}
 #else
 LockResult lock_resident(void* p, uint64_t bytes) {
@@ -125,6 +244,18 @@ LockResult lock_resident(void* p, uint64_t bytes) {
     r.ok = true;
     r.locked_bytes = bytes;
     r.note = "mlock";
+    return r;
+}
+
+LockResult lock_resident_ranges(const std::vector<std::pair<void*, uint64_t>>& regions) {
+    LockResult r;
+    for (const auto& g : regions) {
+        if (g.first == nullptr || g.second == 0) continue;
+        if (mlock(g.first, g.second) != 0) { r.note = "mlock failed (raise ulimit -l)"; r.ok = r.locked_bytes > 0; return r; }
+        r.locked_bytes += g.second;
+    }
+    r.ok = r.locked_bytes > 0;
+    r.note = r.ok ? "mlock of " + std::to_string(regions.size()) + " regions" : "nothing to lock";
     return r;
 }
 
@@ -166,7 +297,23 @@ void advise_willneed(const void* p, uint64_t bytes) {
 void advise_willneed(int fd, uint64_t offset, uint64_t bytes) {
     if (fd < 0 || !read_ahead_enabled()) return;
     for (uint64_t at = 0; at < bytes; at += kAdviseStep)
+#if defined(__APPLE__)   // macOS: F_RDADVISE is the read-ahead hint
+    {
+        radvisory ra{(off_t) (offset + at), (int) std::min(kAdviseStep, bytes - at)};
+        (void) fcntl(fd, F_RDADVISE, &ra);
+    }
+#else
         (void) posix_fadvise(fd, (off_t) (offset + at), (off_t) std::min(kAdviseStep, bytes - at), POSIX_FADV_WILLNEED);
+#endif
+}
+
+void prefetch_ranges(const std::pair<const void*, size_t>* ranges, size_t count) {
+    if (ranges == nullptr || count == 0 || !read_ahead_enabled()) return;
+    for (size_t i = 0; i < count; ++i) {
+        if (ranges[i].first != nullptr && ranges[i].second > 0) {
+            advise_willneed(ranges[i].first, static_cast<uint64_t>(ranges[i].second));
+        }
+    }
 }
 #endif
 

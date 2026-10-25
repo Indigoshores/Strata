@@ -12,12 +12,14 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 #if !defined(_WIN32)
 #include <sys/mman.h>
 #endif
 #include <algorithm>
 #include <atomic>
+#include <mutex>
 #include <thread>
 #include <vector>
 #include <stdexcept>
@@ -212,6 +214,8 @@ struct PleTable::Impl {
     strata::ngram::PleReader::Ticket ticket;
     bool pending = false;
     bool locked = false;
+    // the table is shared by the prompt path and the decode windows; they can use it at once (one on a worker thread)
+    std::recursive_mutex mu;
     uint32_t rows[PLE_N_HEADS] = {};
     uint8_t raw[PLE_N_HEADS * PLE_ROW_BYTES_MAX] = {};
     static constexpr size_t kMaxPrefetch = 16;
@@ -389,6 +393,7 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
 }
 
 void PleTable::wait_prefetches() {
+    std::lock_guard<std::recursive_mutex> lk(impl_->mu);
     if (impl_->n_prefetch == 0) return;
     std::string dummy;
     for (size_t i = 0; i < impl_->n_prefetch; ++i) (void) impl_->reader.collect(impl_->prefetch_tickets[i], dummy);
@@ -396,6 +401,7 @@ void PleTable::wait_prefetches() {
 }
 
 void PleTable::prefetch_rows(const uint32_t* rows16) {
+    std::lock_guard<std::recursive_mutex> lk(impl_->mu);
     if (impl_->mode == PleIo::Direct && impl_->reader.is_open()) {
         for (size_t i = 0; i < impl_->n_prefetch; ++i)
             if (std::memcmp(impl_->prefetch_keys[i], rows16, sizeof(uint32_t) * PLE_N_HEADS) == 0) return;
@@ -444,6 +450,7 @@ uint64_t PleTable::rows() const { return impl_->n_rows; }
 uint64_t PleTable::bytes_read() const { return impl_->bytes_read; }
 
 void PleTable::read_row(uint32_t row, float* out160) const {
+    std::lock_guard<std::recursive_mutex> lk(impl_->mu);
     if (impl_->mode == PleIo::Direct && impl_->reader.is_open()) {
         uint8_t raw[PLE_ROW_BYTES_MAX];
         std::string err;
@@ -465,6 +472,7 @@ void PleTable::read_row(uint32_t row, float* out160) const {
 }
 
 bool PleTable::issue(const uint32_t* rows16) {
+    std::lock_guard<std::recursive_mutex> lk(impl_->mu);
     wait_prefetches();
     std::memcpy(impl_->rows, rows16, sizeof impl_->rows);
     if (impl_->mode == PleIo::Direct) {
@@ -491,6 +499,7 @@ bool PleTable::issue(const uint32_t* rows16) {
 }
 
 bool PleTable::collect(float* out2560, std::string& err) {
+    std::lock_guard<std::recursive_mutex> lk(impl_->mu);
     if (!impl_->pending) { err = "PleTable::collect without issue"; return false; }
     impl_->pending = false;
     if (impl_->mode == PleIo::Direct) {
@@ -505,30 +514,35 @@ bool PleTable::collect(float* out2560, std::string& err) {
 }
 
 bool PleTable::gather_batch(const uint32_t* rows, size_t n_tokens, float* out, std::string& err) {
+    std::lock_guard<std::recursive_mutex> lk(impl_->mu);
     if (impl_->pending) { err = "PleTable::gather_batch while a token is in flight"; return false; }
     const size_t n = n_tokens * (size_t) PLE_N_HEADS;
     if (impl_->mode == PleIo::Direct) {
-        // Fast path: if all requested tokens match our in-flight/completed prefetch slots, collect them directly
+        // Fast path: match each requested token to any in-flight/completed prefetch slot, then collect directly
         // without issuing a second PleReader ticket or copying through RowCache.
-        if (impl_->n_prefetch >= n_tokens && n_tokens <= Impl::kMaxPrefetch) {
+        if (n_tokens <= Impl::kMaxPrefetch) {
+            size_t matched[Impl::kMaxPrefetch];
             bool exact_match = true;
             for (size_t t = 0; t < n_tokens; ++t) {
-                if (std::memcmp(impl_->prefetch_keys[t], rows + t * PLE_N_HEADS, sizeof(uint32_t) * PLE_N_HEADS) != 0) {
-                    exact_match = false;
-                    break;
-                }
+                size_t i = 0;
+                while (i < impl_->n_prefetch &&
+                       std::memcmp(impl_->prefetch_keys[i], rows + t * PLE_N_HEADS,
+                                   sizeof(uint32_t) * PLE_N_HEADS) != 0) ++i;
+                if (i == impl_->n_prefetch) { exact_match = false; break; }
+                matched[t] = i;   // duplicate requests may share one immutable prefetch slot
             }
             if (exact_match) {
+                bool collect_ok = true;
                 for (size_t i = 0; i < impl_->n_prefetch; ++i) {
-                    if (!impl_->reader.collect(impl_->prefetch_tickets[i], err)) {
-                        impl_->n_prefetch = 0;
-                        return false;
-                    }
+                    std::string ignored;
+                    if (!impl_->reader.collect(impl_->prefetch_tickets[i], collect_ok ? err : ignored))
+                        collect_ok = false;   // retain the first error, but drain every output buffer
                 }
                 impl_->n_prefetch = 0;
+                if (!collect_ok) return false;
                 for (size_t t = 0; t < n_tokens; ++t) {
                     for (int h = 0; h < PLE_N_HEADS; ++h) {
-                        impl_->decode(impl_->prefetch_raw[t] + (size_t) h * impl_->rb,
+                        impl_->decode(impl_->prefetch_raw[matched[t]] + (size_t) h * impl_->rb,
                                       out + (t * PLE_N_HEADS + (size_t) h) * PLE_HEAD_DIM);
                     }
                 }
@@ -545,7 +559,39 @@ bool PleTable::gather_batch(const uint32_t* rows, size_t n_tokens, float* out, s
         return true;
     }
     wait_prefetches();
-    for (size_t i = 0; i < n; ++i) read_row(rows[i], out + i * PLE_HEAD_DIM);
+    // #1984 #1971: a mapped table that is not in the file cache served this loop as serial demand faults, one random
+    // 4 KiB page at a time (16 rows a token, 16 x the chunk's tokens for a prompt), and the first chunk of a prompt has
+    // only layer 0 to hide it behind: a cold 27 GB table at ~0.2-1 ms a fault is minutes with no progress mark, which
+    // is what the stall watchdog stops.  Ask the OS for the next window's pages in one go (PrefetchVirtualMemory /
+    // MADV_WILLNEED, a hint that cannot change a value: an unfetched page is faulted by the read) while this window is read.
+    constexpr size_t kWin = 4096;   // rows a window
+    auto hint = [&](size_t a, size_t b) {
+        if (impl_->data == nullptr || !g_ple_prefetch) return;
+#if defined(_WIN32)
+        WIN32_MEMORY_RANGE_ENTRY ranges[kWin];
+        ULONG_PTR k = 0;
+        for (size_t i = a; i < b; ++i) {
+            if (rows[i] >= impl_->n_rows) continue;
+            ranges[k].VirtualAddress = (PVOID) (impl_->data + (size_t) rows[i] * impl_->rb);
+            ranges[k].NumberOfBytes = impl_->rb;
+            ++k;
+        }
+        if (k > 0) (void) PrefetchVirtualMemory(GetCurrentProcess(), k, ranges, 0);
+#else
+        for (size_t i = a; i < b; ++i) {
+            if (rows[i] >= impl_->n_rows) continue;
+            const uintptr_t r0 = (uintptr_t) (impl_->data + (size_t) rows[i] * impl_->rb);
+            const uintptr_t p0 = r0 & ~(uintptr_t) 4095;
+            (void) madvise((void*) p0, (size_t) (r0 + impl_->rb - p0), MADV_WILLNEED);
+        }
+#endif
+    };
+    hint(0, std::min(n, kWin));
+    for (size_t w = 0; w < n; w += kWin) {
+        if (w + kWin < n) hint(w + kWin, std::min(n, w + 2 * kWin));
+        const size_t e = std::min(n, w + kWin);
+        for (size_t i = w; i < e; ++i) read_row(rows[i], out + i * PLE_HEAD_DIM);
+    }
     return true;
 }
 
@@ -569,6 +615,7 @@ std::string PleTable::io_report() const {
 }
 
 void PleTable::gather(const uint32_t* rows16, float* out2560) const {
+    std::lock_guard<std::recursive_mutex> lk(impl_->mu);   // issue + collect as one
     if (impl_->mode == PleIo::Direct) {
         // `gather` stays const for its existing callers; the reader's state is the table's I/O state.
         PleTable* self = const_cast<PleTable*>(this);
@@ -610,6 +657,304 @@ void PleTable::gather(const uint32_t* rows16, float* out2560) const {
     // values occupy [h*160, (h+1)*160).  A head-fastest layout would put element (d, h) at d*16 + h and needs
     // a real transpose - a reshape of the same flat buffer compares equal and would make the check vacuous.
     for (int h = 0; h < PLE_N_HEADS; ++h) read_row(rows16[h], out2560 + (size_t) h * PLE_HEAD_DIM);
+}
+
+// ==================== DYNAMIC <THINK> REASONING OUTPUT N-GRAM CACHE ====================
+
+namespace {
+inline uint64_t mix64(uint64_t x) {
+    x ^= x >> 33;
+    x *= 0xff51afd7ed558ccdull;
+    x ^= x >> 33;
+    x *= 0xc4ceb9fe1a85ec53ull;
+    return x ^ (x >> 33);
+}
+}  // namespace
+
+ThinkNgramCache::ThinkNgramCache(size_t capacity_tokens) {
+    size_t cap = 1024;
+    while (cap < capacity_tokens) cap <<= 1;
+    capacity_ = cap;
+    ring_.assign(capacity_, 0);
+
+    table3_.assign(16384, Slot3{});
+    mask3_ = table3_.size() - 1;
+
+    table2_.assign(16384, Slot2{});
+    mask2_ = table2_.size() - 1;
+
+    const char* ring_env = std::getenv("STRATA_LOOKUP_THINK_RING");
+    if (ring_env != nullptr && std::atoi(ring_env) == 0) {
+        enabled_ = false;
+    } else {
+        enabled_ = true;
+    }
+
+    const char* win_env = std::getenv("STRATA_LOOKUP_2GRAM_WINDOW");
+    if (win_env != nullptr) {
+        int w = std::atoi(win_env);
+        window_2gram_ = (size_t) std::clamp(w, 64, 8192);
+    } else {
+        window_2gram_ = 2048;
+    }
+
+    const char* strict_env = std::getenv("STRATA_LOOKUP_2GRAM_STRICT");
+    if (strict_env != nullptr && std::atoi(strict_env) == 0) {
+        strict_2gram_ = false;
+    } else {
+        strict_2gram_ = true;
+    }
+}
+
+void ThinkNgramCache::reset() {
+    count_ = 0;
+    total_appended_ = 0;
+    last_match_ = 0;
+    std::fill(ring_.begin(), ring_.end(), 0);
+    std::fill(table3_.begin(), table3_.end(), Slot3{});
+    std::fill(table2_.begin(), table2_.end(), Slot2{});
+}
+
+uint64_t ThinkNgramCache::hash3(int32_t a, int32_t b, int32_t c) {
+    const uint64_t u0 = (uint32_t) a;
+    const uint64_t u1 = (uint32_t) b;
+    const uint64_t u2 = (uint32_t) c;
+    return mix64(u0 * 0x9E3779B97F4A7C15ull ^ mix64(u1 + 0x632BE59BD9B4E019ull) ^ (u2 << 1)) | 1ull;
+}
+
+uint64_t ThinkNgramCache::hash2(int32_t a, int32_t b) {
+    const uint64_t u0 = (uint32_t) a;
+    const uint64_t u1 = (uint32_t) b;
+    return mix64(u0 * 0xBF58476D1CE4E5B9ull ^ mix64(u1 + 0x94D049BB133111EBull)) | 1ull;
+}
+
+void ThinkNgramCache::record_at(size_t end_idx) {
+    // 3-gram
+    if (end_idx >= 2 && count_ >= 3) {
+        const int32_t a = ring_[(end_idx - 2) % capacity_];
+        const int32_t b = ring_[(end_idx - 1) % capacity_];
+        const int32_t c = ring_[end_idx % capacity_];
+        const uint64_t k3 = hash3(a, b, c);
+        for (size_t i = k3 & mask3_, probes = 0; probes <= mask3_; i = (i + 1) & mask3_, ++probes) {
+            Slot3& s = table3_[i];
+            if (s.key == k3) {
+                for (int w = 3; w > 0; --w) s.pos[w] = s.pos[w - 1];
+                s.pos[0] = (uint32_t) end_idx;
+                if (s.n < 4) ++s.n;
+                break;
+            }
+            if (s.key == 0) {
+                s.key = k3;
+                s.pos[0] = (uint32_t) end_idx;
+                s.n = 1;
+                break;
+            }
+        }
+    }
+    // 2-gram
+    if (end_idx >= 1 && count_ >= 2) {
+        const int32_t b = ring_[(end_idx - 1) % capacity_];
+        const int32_t c = ring_[end_idx % capacity_];
+        const uint64_t k2 = hash2(b, c);
+        for (size_t i = k2 & mask2_, probes = 0; probes <= mask2_; i = (i + 1) & mask2_, ++probes) {
+            Slot2& s = table2_[i];
+            if (s.key == k2) {
+                for (int w = 7; w > 0; --w) s.pos[w] = s.pos[w - 1];
+                s.pos[0] = (uint32_t) end_idx;
+                if (s.n < 8) ++s.n;
+                break;
+            }
+            if (s.key == 0) {
+                s.key = k2;
+                s.pos[0] = (uint32_t) end_idx;
+                s.n = 1;
+                break;
+            }
+        }
+    }
+}
+
+void ThinkNgramCache::append(const int32_t* tokens, size_t n) {
+    if (!enabled_ || tokens == nullptr || n == 0) return;
+    for (size_t i = 0; i < n; ++i) {
+        const size_t end_idx = total_appended_;
+        ring_[end_idx % capacity_] = tokens[i];
+        total_appended_++;
+        if (count_ < capacity_) count_++;
+        record_at(end_idx);
+    }
+}
+
+int ThinkNgramCache::propose_from_context(const int32_t* ctx, int ctx_len, int max_k, int32_t* out, int* match) {
+    last_match_ = 0;
+    if (match != nullptr) *match = 0;
+    if (!enabled_ || max_k <= 0 || count_ < 2 || total_appended_ < 2) return 0;
+
+    const bool from_ring = (ctx == nullptr || ctx_len <= 0);
+    const size_t cur = total_appended_ - 1;
+
+    // Build the query tail (up to 64 tokens)
+    int32_t qtail[64];
+    int m = 0;
+    if (!from_ring) {
+        m = std::min(ctx_len, 64);
+        for (int i = 0; i < m; ++i) {
+            qtail[m - 1 - i] = ctx[ctx_len - 1 - i];
+        }
+    } else {
+        m = (int) std::min<size_t>(count_, 64);
+        for (int i = 0; i < m; ++i) {
+            const size_t idx = cur - (size_t) i;
+            qtail[m - 1 - i] = ring_[idx % capacity_];
+        }
+    }
+
+    // Attempt 1: 3-gram match
+    if (m >= 3 && count_ >= 3 && total_appended_ >= 3) {
+        const int32_t qa = qtail[m - 3];
+        const int32_t qb = qtail[m - 2];
+        const int32_t qc = qtail[m - 1];
+        const uint64_t k3 = hash3(qa, qb, qc);
+
+        const Slot3* s3 = nullptr;
+        for (size_t i = k3 & mask3_, probes = 0; probes <= mask3_; i = (i + 1) & mask3_, ++probes) {
+            if (table3_[i].key == k3) { s3 = &table3_[i]; break; }
+            if (table3_[i].key == 0) break;
+        }
+
+        if (s3 != nullptr) {
+            size_t best_p3 = 0;
+            int best_len3 = 0;
+            for (int w = 0; w < s3->n; ++w) {
+                const size_t p = s3->pos[w];
+                if (p >= total_appended_) continue;
+                if (from_ring && p >= cur) continue;
+                if (cur - p >= count_) continue; // ring slot overwritten
+                if (p + 1 >= total_appended_) continue; // nothing to propose after p
+
+                int len = 3;
+                while (len < 32 && len < m && (size_t) len <= p) {
+                    const size_t hist_idx = p - len;
+                    if (cur - hist_idx >= count_) break;
+                    if (ring_[hist_idx % capacity_] != qtail[m - 1 - len]) break;
+                    ++len;
+                }
+                if (len > best_len3) {
+                    best_len3 = len;
+                    best_p3 = p;
+                }
+            }
+
+            if (best_len3 >= 3) {
+                int k = 0;
+                for (size_t q = best_p3 + 1; q < total_appended_ && k < max_k; ++q) {
+                    if (cur - q >= count_) break;
+                    if (from_ring && q > cur) break;
+                    out[k++] = ring_[q % capacity_];
+                }
+                if (k > 0) {
+                    last_match_ = best_len3;
+                    if (match != nullptr) *match = best_len3;
+                    return k;
+                }
+            }
+        }
+    }
+
+    // Attempt 2: 2-gram fallback with empirical agreement
+    if (m >= 2 && count_ >= 2 && total_appended_ >= 2) {
+        const int32_t qb = qtail[m - 2];
+        const int32_t qc = qtail[m - 1];
+        const uint64_t k2 = hash2(qb, qc);
+
+        const Slot2* s2 = nullptr;
+        for (size_t i = k2 & mask2_, probes = 0; probes <= mask2_; i = (i + 1) & mask2_, ++probes) {
+            if (table2_[i].key == k2) { s2 = &table2_[i]; break; }
+            if (table2_[i].key == 0) break;
+        }
+
+        if (s2 != nullptr) {
+            size_t valid_pos[8];
+            int n_valid = 0;
+            for (int w = 0; w < s2->n; ++w) {
+                const size_t p = s2->pos[w];
+                if (p >= total_appended_) continue;
+                if (from_ring && p >= cur) continue;
+                if (cur - p >= count_) continue;
+                if (p + 1 >= total_appended_) continue;
+                if (cur - p > window_2gram_) continue;
+                valid_pos[n_valid++] = p;
+            }
+
+            if (n_valid > 0) {
+                // Count occurrences of candidate next tokens among valid positions
+                int32_t cand_tok = ring_[(valid_pos[0] + 1) % capacity_];
+                int agree_count = 0;
+                size_t agreeing_pos[8];
+                for (int v = 0; v < n_valid; ++v) {
+                    if (ring_[(valid_pos[v] + 1) % capacity_] == cand_tok) {
+                        agreeing_pos[agree_count++] = valid_pos[v];
+                    }
+                }
+
+                bool eligible = false;
+                if (strict_2gram_) {
+                    // Strict empirical agreement requires at least 2 observations agreeing and >= 50% consensus
+                    if (agree_count >= 2 && agree_count * 2 >= n_valid) {
+                        eligible = true;
+                    }
+                } else {
+                    // Non-strict allows single occurrence or plurality
+                    if (agree_count >= 1) {
+                        eligible = true;
+                    }
+                }
+
+                if (eligible) {
+                    const size_t best_p = agreeing_pos[0];
+                    int k = 0;
+                    for (int j = 1; j <= max_k; ++j) {
+                        const size_t pos_j = best_p + j;
+                        if (pos_j >= total_appended_) break;
+                        if (cur - pos_j >= count_) break;
+                        if (from_ring && pos_j > cur) break;
+
+                        const int32_t step_tok = ring_[pos_j % capacity_];
+                        if (strict_2gram_) {
+                            int step_agree = 0;
+                            for (int a = 0; a < agree_count; ++a) {
+                                const size_t p_aj = agreeing_pos[a] + j;
+                                if (p_aj < total_appended_ && cur - p_aj < count_ && ring_[p_aj % capacity_] == step_tok) {
+                                    step_agree++;
+                                }
+                            }
+                            if (step_agree < 2 || step_agree * 2 < agree_count) {
+                                break;
+                            }
+                        }
+                        out[k++] = step_tok;
+                    }
+
+                    if (k > 0) {
+                        last_match_ = 2;
+                        if (match != nullptr) *match = 2;
+                        return k;
+                    }
+                }
+            }
+        }
+    }
+
+    return 0;
+}
+
+int ThinkNgramCache::propose(int max_k, int32_t* out, int* match) {
+    return propose_from_context(nullptr, 0, max_k, out, match);
+}
+
+int ThinkNgramCache::propose(const int32_t* tail, int n_tail, int n_pending, int max_k, int32_t* out, int* match) {
+    (void) n_pending;
+    return propose_from_context(tail, n_tail, max_k, out, match);
 }
 
 }  // namespace strata::kernels

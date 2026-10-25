@@ -12,7 +12,7 @@ endif()
 # same wave32 / 64 KiB LDS / sudot4 family as gfx1100, on a unified-memory APU; experimental.
 set(_strata_hip_validated gfx1100 gfx1201)
 set(_strata_hip_community gfx1101 gfx1200)
-set(_strata_hip_unvalidated gfx1010 gfx1011 gfx1012 gfx1102 gfx1103 gfx1030 gfx1031 gfx1034 gfx1150 gfx1151)   # gfx1103: Radeon 780M iGPU, opt-in, portable kernels (no WMMA)
+set(_strata_hip_unvalidated gfx1010 gfx1011 gfx1012 gfx1102 gfx1103 gfx1030 gfx1031 gfx1032 gfx1034 gfx1150 gfx1151 gfx1152)   # gfx1103: Radeon 780M iGPU, opt-in, WMMA kernels like gfx1100; gfx1152: Krackan, Radeon 860M / 840M (#1625), builds with the portable kernels, no card report yet
 # CMake hands HIP a ';' list, but a -DCMAKE_HIP_ARCHITECTURES typed by hand (or ROCm's own Windows tooling) may use
 # spaces, which foreach(IN LISTS) would otherwise treat as one element.
 string(REPLACE " " ";" _strata_hip_norm "${CMAKE_HIP_ARCHITECTURES}")
@@ -63,6 +63,9 @@ set(STRATA_HIP_BLAS_TARGETS roc::hipblas)
 if(hipblas_VERSION VERSION_LESS "1.0")
   find_package(rocblas CONFIG REQUIRED)
   list(APPEND STRATA_HIP_BLAS_TARGETS roc::rocblas)
+else()
+  # the prompt path's rocBLAS solution table (STRATA_ROCBLAS_TUNING, gfx103x) calls rocBLAS by name
+  find_package(rocblas CONFIG QUIET)
 endif()
 find_package(hipblaslt CONFIG QUIET)
 
@@ -74,9 +77,39 @@ if(NOT TARGET roc::hipblas)
 endif()
 if(TARGET roc::hipblaslt)
   set(STRATA_HIPBLASLT_AVAILABLE ON)
+  if(WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/rocm100500-libs/libhipblaslt.lib")
+    set_target_properties(roc::hipblaslt PROPERTIES
+      IMPORTED_IMPLIB "${CMAKE_CURRENT_SOURCE_DIR}/rocm100500-libs/libhipblaslt.lib"
+      IMPORTED_IMPLIB_RELEASE "${CMAKE_CURRENT_SOURCE_DIR}/rocm100500-libs/libhipblaslt.lib"
+      IMPORTED_IMPLIB_DEBUG "${CMAKE_CURRENT_SOURCE_DIR}/rocm100500-libs/libhipblaslt.lib"
+      IMPORTED_IMPLIB_RELWITHDEBINFO "${CMAKE_CURRENT_SOURCE_DIR}/rocm100500-libs/libhipblaslt.lib"
+      IMPORTED_IMPLIB_MINSIZEREL "${CMAKE_CURRENT_SOURCE_DIR}/rocm100500-libs/libhipblaslt.lib"
+    )
+    message(STATUS "Strata: Overrode roc::hipblaslt import library with rocm100500-libs/libhipblaslt.lib")
+  endif()
 else()
   set(STRATA_HIPBLASLT_AVAILABLE OFF)
   message(STATUS "Strata: hipBLASLt not found; solution-table dispatch is unavailable")
+endif()
+if(TARGET roc::rocblas)
+  set(STRATA_ROCBLAS_AVAILABLE ON)
+  if(WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/rocm100500-libs/rocblas.lib")
+    set_target_properties(roc::rocblas PROPERTIES
+      IMPORTED_IMPLIB "${CMAKE_CURRENT_SOURCE_DIR}/rocm100500-libs/rocblas.lib"
+      IMPORTED_IMPLIB_RELEASE "${CMAKE_CURRENT_SOURCE_DIR}/rocm100500-libs/rocblas.lib"
+    )
+  endif()
+else()
+  set(STRATA_ROCBLAS_AVAILABLE OFF)
+  message(STATUS "Strata: rocBLAS CMake package not found; the rocBLAS solution table (gfx103x) is unavailable")
+endif()
+if(TARGET roc::hipblas)
+  if(WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/rocm100500-libs/hipblas.lib")
+    set_target_properties(roc::hipblas PROPERTIES
+      IMPORTED_IMPLIB "${CMAKE_CURRENT_SOURCE_DIR}/rocm100500-libs/hipblas.lib"
+      IMPORTED_IMPLIB_RELEASE "${CMAKE_CURRENT_SOURCE_DIR}/rocm100500-libs/hipblas.lib"
+    )
+  endif()
 endif()
 
 # HIP's link step produces a PIE; make Strata and ggml objects PIC for the ROCm linker.

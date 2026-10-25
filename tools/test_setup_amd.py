@@ -465,5 +465,114 @@ class HipRuntimeBesideExe(unittest.TestCase):
             self.assertEqual(list(Path(d).iterdir()), [])
 
 
+class DeviceAccess(unittest.TestCase):
+    """Linux AMD: /dev/kfd and the render nodes must be openable by the user; setup warns, never refuses."""
+
+    def dev(self, d, kfd=True, nodes=("renderD128",)):
+        root = Path(d)
+        (root / "dri").mkdir()
+        if kfd:
+            (root / "kfd").write_text("")
+        for n in nodes:
+            (root / "dri" / n).write_text("")
+        return str(root)
+
+    def test_accessible_is_silent(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertIsNone(setup.amd_device_access_problem(self.dev(d), access=lambda p, m: True))
+
+    def test_no_kfd_is_not_this_problem(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertIsNone(setup.amd_device_access_problem(self.dev(d, kfd=False), access=lambda p, m: False))
+
+    def test_kfd_denied_names_the_fix(self):
+        with tempfile.TemporaryDirectory() as d:
+            msg = setup.amd_device_access_problem(self.dev(d), access=lambda p, m: not p.endswith("kfd"))
+            self.assertIn("kfd", msg)
+            self.assertNotIn("renderD128", msg)
+            self.assertIn("sudo usermod -aG render,video $USER", msg)
+            self.assertIn("log out and in", msg)
+
+    def test_render_node_denied(self):
+        with tempfile.TemporaryDirectory() as d:
+            msg = setup.amd_device_access_problem(self.dev(d), access=lambda p, m: "renderD" not in p)
+            self.assertIn("renderD128", msg)
+            self.assertNotIn("/kfd", msg)
+
+    def test_engine_names_the_permission_not_another_program(self):
+        src = (Path(setup.__file__).resolve().parent / "src/program/generate.cpp").read_text(encoding="utf-8")
+        i = src.index("cannot open /dev/kfd")
+        guard = src[src.rindex("#if", 0, i):i]
+        self.assertIn("cudaGetDeviceCount", guard)
+        self.assertIn('access("/dev/kfd", R_OK | W_OK)', guard)
+        self.assertIn("STRATA_USE_HIP", guard)               # CUDA builds keep the "another program" text
+        self.assertIn("another program (or an engine that is still exiting)", src)
+
+
+class EngineLaunchEnv(unittest.TestCase):
+    """#2372: every engine program setup runs gets the ready-made HIP engine's rocm/bin on PATH, or Windows shows a
+    "hipblas.dll not found" dialog per DLL and `strata --families` prints nothing (setup then said the engine does
+    not run Qwen3.6)."""
+
+    def engine(self, tmp: Path) -> Path:
+        eng = tmp / "engine"
+        (eng / "rocm" / "bin").mkdir(parents=True)
+        (eng / "BUILD.json").write_text('{"backend": "hip", "lib_dirs": ["rocm/bin"]}', encoding="utf-8")
+        return eng
+
+    def test_engine_env_puts_rocm_bin_first(self):
+        with tempfile.TemporaryDirectory() as t:
+            eng = self.engine(Path(t))
+            with mock.patch.dict("os.environ", {"PATH": "C:\\Windows"}):
+                env = setup.engine_env(eng)
+            self.assertEqual(env["PATH"].split(setup.os.pathsep)[0], str(eng / "rocm" / "bin"))
+            self.assertTrue(env["PATH"].endswith("C:\\Windows"))
+
+    def test_engine_without_lib_dirs_keeps_the_environment(self):
+        with tempfile.TemporaryDirectory() as t:
+            with mock.patch.dict("os.environ", {"PATH": "/usr/bin"}):
+                self.assertEqual(setup.engine_env(Path(t))["PATH"], "/usr/bin")
+
+    def test_families_probe_runs_with_that_env(self):
+        seen = {}
+
+        def fake_run(cmd, **kw):
+            seen["cmd"], seen["env"] = cmd, kw.get("env")
+            return mock.Mock(stdout="qwen4exp qwen35moe\n")
+        with tempfile.TemporaryDirectory() as t:
+            eng = self.engine(Path(t))
+            with mock.patch.object(setup.subprocess, "run", fake_run):
+                names = setup.engine_families(eng)
+            self.assertEqual(names, {"qwen4exp", "qwen35moe"})
+            self.assertEqual(seen["cmd"][1], "--families")
+            self.assertEqual(seen["env"]["PATH"].split(setup.os.pathsep)[0], str(eng / "rocm" / "bin"))
+
+    def test_device_probe_runs_with_that_env(self):
+        seen = {}
+
+        def fake_run(cmd, **kw):
+            seen["env"] = kw.get("env")
+            return mock.Mock(returncode=0, stdout="device 0: AMD Radeon RX 7900 XT\n  arch gfx1100, 20.0 GiB, wave32\n")
+        with tempfile.TemporaryDirectory() as t:
+            eng = self.engine(Path(t))
+            probe = eng / ("strata-device.exe" if setup.WIN else "strata-device")
+            probe.write_text("x")
+            with mock.patch.object(setup.subprocess, "run", fake_run),                     mock.patch.object(setup, "hip_runtime_beside_exe", lambda d: None):
+                found = setup.hip_devices(probe)
+            self.assertEqual(found[0]["arch"], "gfx1100")
+            self.assertEqual(seen["env"]["PATH"].split(setup.os.pathsep)[0], str(eng / "rocm" / "bin"))
+
+
+class TdrPointer(unittest.TestCase):
+    def test_setup_points_windows_gfx12_to_the_entry(self):
+        src = Path(setup.__file__).read_text(encoding="utf-8")
+        self.assertIn('WIN and str(gpu.get("arch") or "").startswith("gfx12")', src)
+        doc = (Path(setup.__file__).resolve().parent / "docs/TROUBLESHOOTING.md").read_text(encoding="utf-8")
+        self.assertIn("Windows AMD: the driver resets", doc)
+        for env in ("STRATA_PF_STEP_SYNC", "STRATA_KV_HOST_DMA"):
+            self.assertIn(env, doc)
+            self.assertIn(env, (Path(setup.__file__).resolve().parent / "src/prefill/prefill.cpp").read_text(encoding="utf-8"))
+
+
 if __name__ == "__main__":
     unittest.main()
