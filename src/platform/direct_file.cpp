@@ -102,12 +102,7 @@ struct DirectFile::Impl {
         return r;
     }
 
-    void issue(const Pending& p) {
-        Req* r;
-        {
-            std::lock_guard<std::mutex> lk(mu);
-            r = take();
-        }
+    void issue_prepared(const Pending& p, Req* r) {
         std::memset(&r->ov, 0, sizeof r->ov);
         r->ov.Offset = (DWORD) (p.offset & 0xFFFFFFFFull);
         r->ov.OffsetHigh = (DWORD) (p.offset >> 32);
@@ -125,14 +120,23 @@ struct DirectFile::Impl {
     }
 
     void worker() {
+        constexpr int kBatch = 32;
+        Pending batch_p[kBatch];
+        Req* batch_r[kBatch];
         std::unique_lock<std::mutex> lk(mu);
         for (;;) {
             cv.wait(lk, [&] { return stop || !queue.empty(); });
             if (stop && queue.empty()) return;
-            const Pending p = queue.front();
-            queue.pop_front();
+            int nb = 0;
+            while (nb < kBatch && !queue.empty()) {
+                batch_p[nb] = queue.front();
+                queue.pop_front();
+                batch_r[nb] = take();
+                ++nb;
+            }
+            if (!queue.empty()) cv.notify_one();
             lk.unlock();
-            issue(p);
+            for (int i = 0; i < nb; ++i) issue_prepared(batch_p[i], batch_r[i]);
             lk.lock();
         }
     }
@@ -184,7 +188,7 @@ bool DirectFile::open(const std::string& path, std::string& err) {
     }
     // Completions of reads that finish synchronously are still queued to the port, so every issued read
     // produces exactly one packet; `wait` is the only completion path.
-    const int n = io_threads(4);
+    const int n = io_threads(8);
     for (int i = 0; i < n; ++i) impl_->pool.emplace_back([this] { strata::aux_cpus::pin_current_thread(); impl_->worker(); });
     return true;
 }
@@ -227,8 +231,8 @@ int DirectFile::wait(Completion* out, int max, int timeout_ms) {
         }
     }
     if (n == max || !is_open()) return n;
-    OVERLAPPED_ENTRY entries[64];
-    const ULONG want = (ULONG) (max - n < 64 ? max - n : 64);
+    OVERLAPPED_ENTRY entries[256];
+    const ULONG want = (ULONG) (max - n < 256 ? max - n : 256);
     ULONG got = 0;
     const DWORD t = timeout_ms < 0 ? INFINITE : (DWORD) timeout_ms;
     if (!GetQueuedCompletionStatusEx(impl_->port, entries, want, &got, n > 0 ? 0 : t, FALSE)) return n;

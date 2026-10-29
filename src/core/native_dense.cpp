@@ -237,8 +237,10 @@ bool NativeDense::keep_unquantized_ple_key(const std::string& pack_dir, std::set
 static void* g_hc_scratch[64][2][2] = {};     // [device][class][slot]
 static cudaEvent_t g_hc_ev[64][2] = {};        // [device][slot]: the prompt path's last reader of the slot
 static bool g_hc_ev_set[64][2] = {};
+static void* g_hc_last_stream[64][2] = {};
 
 NativeDense::~NativeDense() {
+    for (auto& ds : g_hc_last_stream) for (void*& s : ds) s = nullptr;
     for (auto& dev : g_hc_scratch)
         for (auto& cl : dev)
             for (void*& b : cl)
@@ -527,7 +529,7 @@ const uint16_t* NativeDense::hc_bf16_view(const WeightRef& w, void* stream, int 
     void* buf = g_hc_scratch[dev][cls][slot];
     if (buf == nullptr) return nullptr;
     // the prompt path: the scratch may still be read by a GEMM another stream enqueued (batch serving: several slots' prompts)
-    if (cls == 0 && g_hc_ev_set[dev][slot]) cudaStreamWaitEvent((cudaStream_t) stream, g_hc_ev[dev][slot], 0);
+    if (cls == 0 && g_hc_ev_set[dev][slot] && g_hc_last_stream[dev][slot] != stream) cudaStreamWaitEvent((cudaStream_t) stream, g_hc_ev[dev][slot], 0);
     strata::kernels::fused_gr_dequant_q8_0((const uint8_t*) w.hc_q8, (uint16_t*) buf, w.elements / 32, stream);
     return (const uint16_t*) buf;
 }
@@ -537,5 +539,6 @@ void NativeDense::hc_bf16_release(void* stream, int slot, int cls) {
     if (cls != 0 || slot < 0 || slot > 1 || cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64 || g_hc_ev[dev][slot] == nullptr) return;
     cudaEventRecord(g_hc_ev[dev][slot], (cudaStream_t) stream);
     g_hc_ev_set[dev][slot] = true;
+    g_hc_last_stream[dev][slot] = stream;
 }
 } // namespace strata::core

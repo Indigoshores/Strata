@@ -648,17 +648,269 @@ __global__ void __launch_bounds__(HX_NT) kernel_hcd_exact(const uint16_t* __rest
         }
 #endif
 }
+typedef _Float16 pfg_fh2 __attribute__((ext_vector_type(2)));
+struct PfgQ8Stage { uint32_t w0, w1; uint16_t d; };
+
+__device__ __forceinline__ uint16_t pfg_f2bf(float f) {
+    uint32_t u = __float_as_uint(f);
+    if ((u & 0x7fffffffu) > 0x7f800000u) return (uint16_t) ((u >> 16) | 64u);
+    u += 0x7fffu + ((u >> 16) & 1u);
+    return (uint16_t) (u >> 16);
+}
+
+__device__ __forceinline__ uint4 pfg_q8_to_f16(const PfgQ8Stage& st) {
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__)
+    const _Float16 dh = __builtin_bit_cast(_Float16, st.d);
+    const pfg_fh2 d2 = pfg_fh2{dh, dh}, magic2 = pfg_fh2{(_Float16) -1152.0f, (_Float16) -1152.0f};
+    const uint32_t c0 = st.w0 ^ 0x80808080u, c1 = st.w1 ^ 0x80808080u;
+    const uint32_t p00 = __builtin_amdgcn_perm(c0, 0x64646464u, 0x01050004u);
+    const uint32_t p01 = __builtin_amdgcn_perm(c0, 0x64646464u, 0x03070206u);
+    const uint32_t p10 = __builtin_amdgcn_perm(c1, 0x64646464u, 0x01050004u);
+    const uint32_t p11 = __builtin_amdgcn_perm(c1, 0x64646464u, 0x03070206u);
+    const pfg_fh2 h0 = (__builtin_bit_cast(pfg_fh2, p00) + magic2) * d2;
+    const pfg_fh2 h1 = (__builtin_bit_cast(pfg_fh2, p01) + magic2) * d2;
+    const pfg_fh2 h2 = (__builtin_bit_cast(pfg_fh2, p10) + magic2) * d2;
+    const pfg_fh2 h3 = (__builtin_bit_cast(pfg_fh2, p11) + magic2) * d2;
+    return make_uint4(__builtin_bit_cast(uint32_t, h0), __builtin_bit_cast(uint32_t, h1),
+                      __builtin_bit_cast(uint32_t, h2), __builtin_bit_cast(uint32_t, h3));
+#else
+    (void) st;
+    return make_uint4(0u, 0u, 0u, 0u);
+#endif
+}
+
+__global__ void __launch_bounds__(256) kernel_hcdown_q8_0(const uint16_t* __restrict__ X, int ldx,
+                                                          const uint8_t* __restrict__ Wd, const uint16_t* __restrict__ Wi,
+                                                          int nd, int ni, float* __restrict__ lo, float* __restrict__ inj,
+                                                          int M, int K) {
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__)
+    constexpr int BN = 128, WN = 32, TN = 2, BK64 = 64, LDK64 = BK64 + 8;
+    __shared__ __align__(16) uint16_t sA[BM][LDK64];
+    __shared__ __align__(16) uint16_t sB[BN][LDK64];
+    const int N = nd + ni;
+    const size_t row_bytes = (size_t) (K / 32) * 34;
+    const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5, l16 = lane & 15, hi = lane >> 4;
+    const int wm = wave & 1, wn = wave >> 1;
+    const int num_m = (M + BM - 1) / BM, num_n = (N + BN - 1) / BN, b = blockIdx.x;
+    const int group = b / (GM * num_n), first_m = group * GM, gsize = min(GM, num_m - first_m);
+    const int m0 = (first_m + (b % (GM * num_n)) % gsize) * BM, n0 = ((b % (GM * num_n)) / gsize) * BN;
+    const int sr = tid >> 3, sq = tid & 7;
+    auto ldA = [&](int k0, int r) -> uint4 {
+        return *reinterpret_cast<const uint4*>(X + (size_t) min(m0 + r, M - 1) * ldx + k0 + 8 * sq);
+    };
+    auto ldB = [&](int k0, int r) -> uint4 {
+        const int n = min(n0 + r, N - 1);
+        if (n >= nd) return *reinterpret_cast<const uint4*>(Wi + (size_t) (n - nd) * K + k0 + 8 * sq);
+        const uint8_t* blk = Wd + (size_t) n * row_bytes + (size_t) ((k0 >> 5) + (sq >> 2)) * 34;
+        const float d = __half2float(__ushort_as_half(*reinterpret_cast<const uint16_t*>(blk)));
+        const uint16_t* q16 = reinterpret_cast<const uint16_t*>(blk + 2 + 8 * (sq & 3));
+        __align__(16) uint16_t out8[8];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const uint16_t w = q16[j];
+            out8[2 * j] = pfg_f2bf((float) (int8_t) (w & 0xFFu) * d);
+            out8[2 * j + 1] = pfg_f2bf((float) (int8_t) (w >> 8) * d);
+        }
+        return *reinterpret_cast<const uint4*>(out8);
+    };
+    uint4 ra0, ra1, ra2, ra3, rb0, rb1, rb2, rb3;
+    auto load = [&](int k0) {
+        ra0 = ldA(k0, sr); ra1 = ldA(k0, sr + 32); ra2 = ldA(k0, sr + 64); ra3 = ldA(k0, sr + 96);
+        rb0 = ldB(k0, sr); rb1 = ldB(k0, sr + 32); rb2 = ldB(k0, sr + 64); rb3 = ldB(k0, sr + 96);
+    };
+    auto store = [&]() {
+        *reinterpret_cast<uint4*>(&sA[sr][8 * sq]) = ra0; *reinterpret_cast<uint4*>(&sA[sr + 32][8 * sq]) = ra1;
+        *reinterpret_cast<uint4*>(&sA[sr + 64][8 * sq]) = ra2; *reinterpret_cast<uint4*>(&sA[sr + 96][8 * sq]) = ra3;
+        *reinterpret_cast<uint4*>(&sB[sr][8 * sq]) = rb0; *reinterpret_cast<uint4*>(&sB[sr + 32][8 * sq]) = rb1;
+        *reinterpret_cast<uint4*>(&sB[sr + 64][8 * sq]) = rb2; *reinterpret_cast<uint4*>(&sB[sr + 96][8 * sq]) = rb3;
+    };
+    f8 acc[4][TN];
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < TN; ++j) acc[i][j] = f8{0, 0, 0, 0, 0, 0, 0, 0};
+    load(0);
+    store();
+    __syncthreads();
+    const int ar = 64 * wm + l16, br = WN * wn + l16;
+    for (int k0 = 0; k0 < K; k0 += BK64) {
+        const bool more = k0 + BK64 < K;
+        if (more) load(k0 + BK64);
+#pragma unroll
+        for (int ks = 0; ks < BK64; ks += 16) {
+            const hb16 a0 = bfrag(&sA[ar][ks]), a1 = bfrag(&sA[ar + 16][ks]), a2 = bfrag(&sA[ar + 32][ks]),
+                       a3 = bfrag(&sA[ar + 48][ks]);
+            const hb16 b0 = bfrag(&sB[br][ks]), b1 = bfrag(&sB[br + 16][ks]);
+            acc[0][0] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a0, b0, acc[0][0]);
+            acc[1][0] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a1, b0, acc[1][0]);
+            acc[2][0] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a2, b0, acc[2][0]);
+            acc[3][0] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a3, b0, acc[3][0]);
+            acc[0][1] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a0, b1, acc[0][1]);
+            acc[1][1] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a1, b1, acc[1][1]);
+            acc[2][1] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a2, b1, acc[2][1]);
+            acc[3][1] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a3, b1, acc[3][1]);
+        }
+        if (more) {
+            __syncthreads();
+            store();
+            __syncthreads();
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < TN; ++j) {
+            const int n = n0 + WN * wn + 16 * j + l16;
+            if (n >= N) continue;
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const int m = m0 + 64 * wm + 16 * i + 2 * e + hi;
+                if (m < M) {
+                    if (n < nd) lo[(size_t) m * nd + n] = acc[i][j][e];
+                    else inj[(size_t) m * ni + (n - nd)] = acc[i][j][e];
+                }
+            }
+        }
+#endif
+}
+
+template <int BN, int WN>
+__global__ void __launch_bounds__(256) kernel_bk64_q8_0(const _Float16* __restrict__ X, const uint8_t* __restrict__ W_q8,
+                                                        float* __restrict__ Y, int M, int N, int K, int ldy,
+                                                        int accumulate, int ldx) {
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__)
+    constexpr int TN = WN / 16, PASSB = BN / 32, BK64 = 64, LDK64 = BK64 + 8;
+    __shared__ __align__(16) _Float16 sA[BM][LDK64];
+    __shared__ __align__(16) _Float16 sB[BN][LDK64];
+    const size_t row_bytes = (size_t) (K / 32) * 34;
+    const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5, l16 = lane & 15, hi = lane >> 4;
+    const int wm = wave & 1, wn = wave >> 1;
+    const int num_m = (M + BM - 1) / BM, num_n = (N + BN - 1) / BN, b = blockIdx.x;
+    const int group = b / (GM * num_n), first_m = group * GM, gsize = min(GM, num_m - first_m);
+    const int m0 = (first_m + (b % (GM * num_n)) % gsize) * BM, n0 = ((b % (GM * num_n)) / gsize) * BN;
+    const int sr = tid >> 3, sq = tid & 7;
+    auto ldA = [&](int k0, int r) -> uint4 {
+        return *reinterpret_cast<const uint4*>(X + (size_t) min(m0 + r, M - 1) * ldx + k0 + 8 * sq);
+    };
+    auto ldB = [&](int k0, int r) -> PfgQ8Stage {
+        const int n = min(n0 + r, N - 1);
+        const uint8_t* blk = W_q8 + (size_t) n * row_bytes + (size_t) ((k0 >> 5) + (sq >> 2)) * 34;
+        const uint16_t* q16 = reinterpret_cast<const uint16_t*>(blk + 2 + 8 * (sq & 3));
+        PfgQ8Stage st;
+        st.d = *reinterpret_cast<const uint16_t*>(blk);
+        st.w0 = (uint32_t) q16[0] | ((uint32_t) q16[1] << 16);
+        st.w1 = (uint32_t) q16[2] | ((uint32_t) q16[3] << 16);
+        return st;
+    };
+    uint4 ra[4];
+    PfgQ8Stage rb[PASSB];
+    auto load = [&](int k0) {
+#pragma unroll
+        for (int p = 0; p < 4; ++p) ra[p] = ldA(k0, sr + 32 * p);
+#pragma unroll
+        for (int p = 0; p < PASSB; ++p) rb[p] = ldB(k0, sr + 32 * p);
+    };
+    auto store = [&]() {
+#pragma unroll
+        for (int p = 0; p < 4; ++p) *reinterpret_cast<uint4*>(&sA[sr + 32 * p][8 * sq]) = ra[p];
+#pragma unroll
+        for (int p = 0; p < PASSB; ++p) *reinterpret_cast<uint4*>(&sB[sr + 32 * p][8 * sq]) = pfg_q8_to_f16(rb[p]);
+    };
+    f8 acc[4][TN];
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < TN; ++j) acc[i][j] = f8{0, 0, 0, 0, 0, 0, 0, 0};
+    load(0);
+    store();
+    __syncthreads();
+    const int ar = 64 * wm + l16, br = WN * wn + l16;
+    for (int k0 = 0; k0 < K; k0 += BK64) {
+        const bool more = k0 + BK64 < K;
+        if (more) load(k0 + BK64);
+#pragma unroll
+        for (int ks = 0; ks < BK64; ks += 16) {
+            const h16 a0 = frag(&sA[ar][ks]), a1 = frag(&sA[ar + 16][ks]), a2 = frag(&sA[ar + 32][ks]),
+                      a3 = frag(&sA[ar + 48][ks]);
+#pragma unroll
+            for (int j = 0; j < TN; ++j) {
+                const h16 bj = frag(&sB[br + 16 * j][ks]);
+                acc[0][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0, bj, acc[0][j]);
+                acc[1][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1, bj, acc[1][j]);
+                acc[2][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a2, bj, acc[2][j]);
+                acc[3][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a3, bj, acc[3][j]);
+            }
+        }
+        if (more) {
+            __syncthreads();
+            store();
+            __syncthreads();
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < TN; ++j) {
+            const int n = n0 + WN * wn + 16 * j + l16;
+            if (n >= N) continue;
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const int m = m0 + 64 * wm + 16 * i + 2 * e + hi;
+                if (m < M) {
+                    float* y = Y + (size_t) m * ldy + n;
+                    *y = accumulate ? *y + acc[i][j][e] : acc[i][j][e];
+                }
+            }
+        }
+#endif
+}
 }  // namespace pfg
 
 bool strata_pf_hcdown_bf16(const uint16_t* X, int64_t ldx, const uint16_t* Wd, const uint16_t* Wi, int64_t nd,
                            int64_t ni, float* lo, float* inj, int64_t T, int64_t K, void* stream) {
-    if (!X || !Wd || !Wi || !lo || !inj || T < 64 || nd < 1 || ni < 0 || K % 64 != 0 || ldx < K || ldx % 8 != 0) return false;
+    if (!X || !Wd || !Wi || !lo || !inj || T < 16 || nd < 1 || ni < 0 || K % 64 != 0 || ldx < K || ldx % 8 != 0) return false;
     if (T > (1LL << 30) || K > (1LL << 30) || ldx > (1LL << 30)) return false;
     if (!strata_wmma_gfx11_device()) return false;
     const int64_t mt = (T + pfg::BM - 1) / pfg::BM;
     const unsigned grid = (unsigned) (mt * ((nd + ni + 127) / 128));
     pfg::kernel_hcdown<<<grid, 256, 0, static_cast<hipStream_t>(stream)>>>(X, (int) ldx, Wd, Wi, (int) nd, (int) ni,
                                                                             lo, inj, (int) T, (int) K);
+    return hipGetLastError() == hipSuccess;
+}
+
+bool strata_pf_hcdown_q8_0(const uint16_t* X, int64_t ldx, const void* Wd_q8_0, const uint16_t* Wi, int64_t nd,
+                           int64_t ni, float* lo, float* inj, int64_t T, int64_t K, void* stream) {
+    if (!X || !Wd_q8_0 || !Wi || !lo || !inj || T < 16 || nd < 1 || ni < 0 || K % 64 != 0 || ldx < K || ldx % 8 != 0) return false;
+    if ((reinterpret_cast<uintptr_t>(Wd_q8_0) & 1) != 0 || T > (1LL << 30) || K > (1LL << 30) || ldx > (1LL << 30)) return false;
+    if (!strata_wmma_gfx11_device()) return false;
+    const int64_t mt = (T + pfg::BM - 1) / pfg::BM;
+    const unsigned grid = (unsigned) (mt * ((nd + ni + 127) / 128));
+    pfg::kernel_hcdown_q8_0<<<grid, 256, 0, static_cast<hipStream_t>(stream)>>>(
+        X, (int) ldx, static_cast<const uint8_t*>(Wd_q8_0), Wi, (int) nd, (int) ni, lo, inj, (int) T, (int) K);
+    return hipGetLastError() == hipSuccess;
+}
+
+bool strata_pf_gemm_q8_0_ld(const uint16_t* X, int64_t ldx, const void* W_q8_0, float* Y, int64_t T,
+                            int64_t N, int64_t K, int64_t ldy, float beta, void* stream) {
+    if (!X || !W_q8_0 || !Y || T < 16 || N < 512 || K % 64 != 0 || K < 64) return false;
+    if ((reinterpret_cast<uintptr_t>(W_q8_0) & 1) != 0 || (beta != 0.0f && beta != 1.0f)) return false;
+    if (ldy <= 0) ldy = N;
+    if (ldx <= 0) ldx = K;
+    if (ldx < K || ldx % 8 != 0 || ldx > (1LL << 30) || ldy < N || T > (1LL << 30) || N > (1LL << 30) || K > (1LL << 30))
+        return false;
+    if (!strata_wmma_gfx11_device()) return false;
+    hipStream_t s = static_cast<hipStream_t>(stream);
+    const int acc = beta == 1.0f ? 1 : 0;
+    const int64_t mt = (T + pfg::BM - 1) / pfg::BM;
+    if (N >= 1024 && mt * ((N + 255) / 256) >= 40) {
+        const unsigned grid = (unsigned) (mt * ((N + 255) / 256));
+        pfg::kernel_bk64_q8_0<256, 64><<<grid, 256, 0, s>>>((const _Float16*) X, (const uint8_t*) W_q8_0, Y,
+                                                            (int) T, (int) N, (int) K, (int) ldy, acc, (int) ldx);
+    } else {
+        const unsigned grid = (unsigned) (mt * ((N + 127) / 128));
+        pfg::kernel_bk64_q8_0<128, 32><<<grid, 256, 0, s>>>((const _Float16*) X, (const uint8_t*) W_q8_0, Y,
+                                                            (int) T, (int) N, (int) K, (int) ldy, acc, (int) ldx);
+    }
     return hipGetLastError() == hipSuccess;
 }
 
@@ -680,7 +932,7 @@ bool strata_pf_gemm_f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t 
 
 bool strata_pf_gemm_f16_ld(const uint16_t* X, int64_t ldx, const uint16_t* W, int64_t ldw, float* Y, int64_t T,
                            int64_t N, int64_t K, int64_t ldy, float beta, void* stream) {
-    if (!X || !W || !Y || T < 64 || N < 512 || K % pfg::BK != 0 || K < pfg::BK) return false;
+    if (!X || !W || !Y || T < 16 || N < 512 || K % pfg::BK != 0 || K < pfg::BK) return false;
     if (beta != 0.0f && beta != 1.0f) return false;
     if (ldy <= 0) ldy = N;
     if (ldx < K || ldw < K || ldx % 8 != 0 || ldw % 8 != 0 || ldx > (1LL << 30) || ldw > (1LL << 30)) return false;
@@ -995,6 +1247,11 @@ bool strata_wmma_gemm_q8_0(const void* X, bool x_is_f16, int64_t ldx,
                            void* stream) {
     if (!X || !W_q8_0 || !Y || T <= 0 || N <= 0 || K <= 0 || K % 32 != 0 || N % 16 != 0) return false;
     if (!strata_wmma_gfx11_device()) return false;
+    static const int64_t q8_min_t = [] {
+        const char* v = std::getenv("STRATA_PF_GEMM_Q8_MIN_T");
+        return v && v[0] != '\0' ? (int64_t) std::atoll(v) : (int64_t) 16;
+    }();
+    if (T < q8_min_t) return false;
     if (ldy <= 0) ldy = N;
     if (ldx < K) return false;
     hipStream_t s = static_cast<hipStream_t>(stream);
@@ -1024,6 +1281,13 @@ bool strata_pf_hcdown_bf16(const uint16_t*, int64_t, const uint16_t*, const uint
     return false;
 }
 bool strata_pf_hcdown_exact_bf16(const uint16_t*, int64_t, const uint16_t*, float*, int64_t, int64_t, int64_t, void*) {
+    return false;
+}
+bool strata_pf_hcdown_q8_0(const uint16_t*, int64_t, const void*, const uint16_t*, int64_t, int64_t, float*, float*,
+                           int64_t, int64_t, void*) {
+    return false;
+}
+bool strata_pf_gemm_q8_0_ld(const uint16_t*, int64_t, const void*, float*, int64_t, int64_t, int64_t, int64_t, float, void*) {
     return false;
 }
 bool strata_wmma_gemm_f16(const uint16_t*, const uint16_t*, float*,

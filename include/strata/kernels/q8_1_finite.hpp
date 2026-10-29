@@ -19,10 +19,21 @@ __device__ __forceinline__ float q8_1_finite(const float v) {
     return fabsf(v) > kHalfMax ? copysignf(kHalfMax, v) : v;
 }
 
+/// #3948: match fast-math division on CUDA translation units opting into STRATA_Q81_FASTMATH_DIV; HIP keeps exact a / b.
+__device__ __forceinline__ float q81_div(const float a, const float b) {
+#if defined(STRATA_Q81_FASTMATH_DIV) && defined(__CUDA_ARCH__) && !defined(__HIPCC__)
+    float r;
+    asm("div.full.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+    return r;
+#else
+    return a / b;
+#endif
+}
+
 /// The block's quantized value of `xi` for the (finite) scale `d`; `amax` = 0 is an all-zero block.
 __device__ __forceinline__ int8_t q8_1_quant(const float xi, const float d, const float amax) {
     if (amax == 0.0f) return 0;
-    const float q = roundf(xi / d);
+    const float q = roundf(q81_div(xi, d));
     return (int8_t) (q > 127.0f ? 127.0f : q < -127.0f ? -127.0f : q);
 }
 

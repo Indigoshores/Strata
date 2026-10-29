@@ -90,12 +90,14 @@ __device__ __forceinline__ bool work_item(const Batch& b, const int32_t* ts, con
     static_assert(BN == kTileRows || BN == 2 * kTileRows, "one tile or a pair");
     const int t0 = ts[b.e0];
     if (w >= (ts[b.e1] - t0) * NFB) return false;
-    const int2 tl = tiles[t0 + w / NFB];
+    const int ti = t0 + w / NFB;
+    const int2 tl = tiles[ti];
     fb = w % NFB;
     e = tl.x;
     row0 = tl.y;
     if (BN > kTileRows && ((t0 + w / NFB - ts[e]) & 1)) return false;
-    nrows = min(BN, off[e + 1] - row0);
+    const int cap_rows = (BN > kTileRows && (ti + 1 < ts[e + 1])) ? BN : kTileRows;
+    nrows = min(cap_rows, off[e + 1] - row0);
     return true;
 }
 
@@ -225,7 +227,7 @@ __device__ __forceinline__ void gu_epilogue(const v8f (&acc)[BN / 16], uint8_t* 
 /// consecutive FP32 rows per routed row into dm [routed row][2560].
 template <int BN>
 __device__ __forceinline__ void down_epilogue(const v8f (&acc)[BN / 16], uint8_t* lds, int tid, int live_tiles, int nrows, int row0,
-                                              int fb, float* __restrict__ dm) {
+                                              int fb, float* __restrict__ dm, bool dm_f16 = false) {
     const int wave = tid >> 5, lane = tid & 31, sub_lane = lane & 15, half_id = lane >> 4;
     float* tile = reinterpret_cast<float*>(lds) + wave * 256;
     const int r0 = fb * ROWS + wave * 16;
@@ -238,7 +240,15 @@ __device__ __forceinline__ void down_epilogue(const v8f (&acc)[BN / 16], uint8_t
 #pragma unroll
         for (int q = 0; q < 8; ++q) {
             const int flat = q * 32 + lane, t = j * 16 + (flat >> 4);
-            if (t < nrows) dm[(size_t) (row0 + t) * 2560 + r0 + (flat & 15)] = tile[flat];
+            if (t < nrows) {
+                const float fv = tile[flat];
+                if (dm_f16) {
+                    const float sv = isnan(fv) ? fv : fminf(fmaxf(fv, -65504.0f), 65504.0f);
+                    reinterpret_cast<uint16_t*>(dm)[(size_t) (row0 + t) * 2560 + r0 + (flat & 15)] = __half_as_ushort(__float2half_rn(sv));
+                } else {
+                    dm[(size_t) (row0 + t) * 2560 + r0 + (flat & 15)] = fv;
+                }
+            }
         }
         __builtin_amdgcn_wave_barrier();
     }

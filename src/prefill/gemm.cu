@@ -1067,9 +1067,18 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
     // #313 (opt-in STRATA_WMMA_GEMM=1): RDNA3 / RDNA3.5 WMMA dense GEMM, before hipBLASLt (falls through when false)
     static const bool wmma_on = [] { const char* v = std::getenv("STRATA_WMMA_GEMM"); return v && v[0] != 0 && v[0] != '0'; }();
     static const bool pf_on = [] { const char* v = std::getenv("STRATA_PF_GEMM"); return v && v[0] == '1'; }();
-    static const int64_t pf_min_t = [] { const char* v = std::getenv("STRATA_PF_SWITCH_MIN_T"); return v ? (int64_t) std::atoll(v) : (int64_t) 0; }();
+    static const int64_t pf_min_t = [] {
+        const char* v = std::getenv("STRATA_PF_GEMM_MIN_T");
+        if (v && v[0] != '\0') return (int64_t) std::atoll(v);
+        v = std::getenv("STRATA_PF_SWITCH_MIN_T");
+        return v ? (int64_t) std::atoll(v) : (int64_t) 0;
+    }();
+    static const int64_t wmma_min_t = [] {
+        const char* v = std::getenv("STRATA_WMMA_GEMM_MIN_T");
+        return v && v[0] != '\0' ? (int64_t) std::atoll(v) : (int64_t) 16;
+    }();
     if (pf_on && T >= pf_min_t && strata_pf_gemm_f16(X, W, Y, T, N, K, ldy, beta, stream_)) return;   // S23: opt-in
-    if (wmma_on && T >= 16 && (beta == 0.0f || beta == 1.0f) &&
+    if (wmma_on && T >= wmma_min_t && (beta == 0.0f || beta == 1.0f) &&
         strata_wmma_gemm_f16(X, W, Y, T, N, K, ldy, beta, stream_)) {
         return;
     }
@@ -1249,8 +1258,22 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
     // channels (gemm_probe8: K 6144 19 -> 29 TFLOPS from W alone, 35 with X padded too).  Bitwise the same products.
     static const bool pad_on = [] { const char* v = std::getenv("STRATA_PF_PAD"); return v && v[0] == '1'; }();
     static const bool pf_on = [] { const char* v = std::getenv("STRATA_PF_GEMM"); return v && v[0] == '1'; }();
-    static const int64_t pf_min_t = [] { const char* v = std::getenv("STRATA_PF_SWITCH_MIN_T"); return v ? (int64_t) std::atoll(v) : (int64_t) 0; }();
-    if (pad_on && pf_on && T >= pf_min_t && T >= 64 && N >= 512 && K % 32 == 0 && N * (K + 64) <= scratch_elems_) {
+    static const int64_t pf_min_t = [] {
+        const char* v = std::getenv("STRATA_PF_GEMM_MIN_T");
+        if (v && v[0] != '\0') return (int64_t) std::atoll(v);
+        v = std::getenv("STRATA_PF_SWITCH_MIN_T");
+        return v ? (int64_t) std::atoll(v) : (int64_t) 0;
+    }();
+    static const bool pf_q8 = [] { const char* v = std::getenv("STRATA_PF_GEMM_Q8"); return v && v[0] == '1'; }();
+    static const int64_t pf_q8_max_t = [] {
+        const char* v = std::getenv("STRATA_PF_GEMM_Q8_MAX_T");
+        return v && v[0] != '\0' ? (int64_t) std::atoll(v) : (int64_t) 512;
+    }();
+    if (pf_q8 && pf_on && ggml_type == 8 && T >= pf_min_t && T >= 16 && T <= pf_q8_max_t && N >= 512 && K % 64 == 0 &&
+        strata_pf_gemm_q8_0_ld(X, ldx > 0 ? ldx : K, W_blocks, Y, T, N, K, ldy, beta, stream_)) {
+        return;
+    }
+    if (pad_on && pf_on && T >= pf_min_t && T >= 16 && N >= 512 && K % 32 == 0 && N * (K + 64) <= scratch_elems_) {
         const int64_t ldw = K + 64;
         if (strata::kernels::dequant_f16_ld(ggml_type, W_blocks, 0, N, K, ldw, scratch_, stream_) &&
             strata_pf_gemm_f16_ld(X, ldx > 0 ? ldx : K, scratch_, ldw, Y, T, N, K, ldy, beta, stream_)) {

@@ -415,6 +415,136 @@ int main() {
         }
     }
 
+    // Direct Q8_0 WMMA parity checks: strata_pf_gemm_q8_0_ld vs strata_pf_gemm_f16_ld and
+    // strata_pf_hcdown_q8_0 vs strata_pf_hcdown_bf16 must be BITWISE IDENTICAL across normal-range scales.
+    {
+        struct Q8Shape { int64_t T, N, K; float beta; };
+        const Q8Shape q8_shapes[] = {
+            {31, 640, 2560, 0.0f},     // T=31 message-boundary tail chunk (<128, 32> short-T path)
+            {31, 2560, 6144, 0.0f},    // T=31 wide N=2560 K=6144 projection path
+            {129, 640, 2560, 0.0f},
+            {408, 1280, 2560, 0.0f},   // <128, 32> short-T occupancy path
+            {408, 2560, 640, 1.0f},    // <256, 64> beta=1 path
+            {1024, 2560, 2560, 0.0f},  // <256, 64> full tile path
+        };
+        std::mt19937 qrng(20261028u);
+        std::uniform_int_distribution<int> qdist(-127, 127);
+        std::uniform_int_distribution<int> sdist(1, 16);
+        for (const auto& s : q8_shapes) {
+            const int64_t ldx = s.K + 64, ldw = s.K + 64, ldy = s.N;
+            std::vector<uint16_t> hx((size_t) s.T * ldx, 0);
+            std::vector<uint16_t> hwf16((size_t) s.N * ldw, 0);
+            const size_t row_bytes = (size_t) (s.K / 32) * 34;
+            std::vector<uint8_t> hwq8((size_t) s.N * row_bytes, 0);
+            for (int64_t t = 0; t < s.T; ++t)
+                for (int64_t k = 0; k < s.K; ++k)
+                    hx[(size_t) t * ldx + k] = encode(qdist(qrng) * (1.0f / 64.0f), false);
+            for (int64_t n = 0; n < s.N; ++n) {
+                for (int64_t g = 0; g < s.K / 32; ++g) {
+                    uint8_t* blk = hwq8.data() + (size_t) n * row_bytes + (size_t) g * 34;
+                    const float d = sdist(qrng) * (1.0f / 256.0f);
+                    const uint16_t dh = encode(d, false);
+                    std::memcpy(blk, &dh, 2);
+                    const float df = decode(dh, false);
+                    for (int j = 0; j < 32; ++j) {
+                        const int8_t q = (int8_t) qdist(qrng);
+                        blk[2 + j] = (uint8_t) q;
+                        hwf16[(size_t) n * ldw + g * 32 + j] = encode((float) q * df, false);
+                    }
+                }
+            }
+            std::vector<float> init_y((size_t) s.T * ldy, 0.25f);
+            DeviceBuffer qx(hx.size() * 2), qwf16(hwf16.size() * 2), qwq8(hwq8.size());
+            DeviceBuffer qy_ref(init_y.size() * 4), qy_got(init_y.size() * 4);
+            HIP_CHECK(hipMemcpyAsync(qx.p, hx.data(), hx.size() * 2, hipMemcpyHostToDevice, stream));
+            HIP_CHECK(hipMemcpyAsync(qwf16.p, hwf16.data(), hwf16.size() * 2, hipMemcpyHostToDevice, stream));
+            HIP_CHECK(hipMemcpyAsync(qwq8.p, hwq8.data(), hwq8.size(), hipMemcpyHostToDevice, stream));
+            HIP_CHECK(hipMemcpyAsync(qy_ref.p, init_y.data(), init_y.size() * 4, hipMemcpyHostToDevice, stream));
+            HIP_CHECK(hipMemcpyAsync(qy_got.p, init_y.data(), init_y.size() * 4, hipMemcpyHostToDevice, stream));
+            const bool ok_ref = strata_pf_gemm_f16_ld((const uint16_t*) qx.p, ldx, (const uint16_t*) qwf16.p, ldw,
+                                                      (float*) qy_ref.p, s.T, s.N, s.K, ldy, s.beta, stream);
+            const bool ok_got = strata_pf_gemm_q8_0_ld((const uint16_t*) qx.p, ldx, qwq8.p,
+                                                       (float*) qy_got.p, s.T, s.N, s.K, ldy, s.beta, stream);
+            if (!ok_ref || !ok_got) {
+                failure_count++;
+                std::fprintf(stderr, "FAIL: strata_pf_gemm_q8_0_ld declined shape T=%lld N=%lld K=%lld\n",
+                             (long long) s.T, (long long) s.N, (long long) s.K);
+            } else {
+                std::vector<float> y_ref(init_y.size()), y_got(init_y.size());
+                HIP_CHECK(hipMemcpyAsync(y_ref.data(), qy_ref.p, init_y.size() * 4, hipMemcpyDeviceToHost, stream));
+                HIP_CHECK(hipMemcpyAsync(y_got.data(), qy_got.p, init_y.size() * 4, hipMemcpyDeviceToHost, stream));
+                HIP_CHECK(hipStreamSynchronize(stream));
+                if (std::memcmp(y_ref.data(), y_got.data(), init_y.size() * 4) != 0) {
+                    failure_count++;
+                    std::fprintf(stderr, "FAIL: strata_pf_gemm_q8_0_ld bitwise mismatch T=%lld N=%lld K=%lld\n",
+                                 (long long) s.T, (long long) s.N, (long long) s.K);
+                } else {
+                    passed_count++;
+                }
+            }
+        }
+
+        // strata_pf_hcdown_q8_0 vs strata_pf_hcdown_bf16 bitwise parity
+        for (const int64_t T : { (int64_t) 31, (int64_t) 257 }) {
+            const int64_t nd = 320, ni = 4, K = 10240, ldx = K + 64;
+            const size_t row_bytes = (size_t) (K / 32) * 34;
+            std::vector<uint16_t> hx((size_t) T * ldx, 0), hwd_bf16((size_t) nd * K, 0), hwi((size_t) ni * K, 0);
+            std::vector<uint8_t> hwd_q8((size_t) nd * row_bytes, 0);
+            for (int64_t t = 0; t < T; ++t)
+                for (int64_t k = 0; k < K; ++k)
+                    hx[(size_t) t * ldx + k] = encode(qdist(qrng) * (1.0f / 64.0f), true);
+            for (int64_t n = 0; n < ni; ++n)
+                for (int64_t k = 0; k < K; ++k)
+                    hwi[(size_t) n * K + k] = encode(qdist(qrng) * (1.0f / 64.0f), true);
+            for (int64_t n = 0; n < nd; ++n) {
+                for (int64_t g = 0; g < K / 32; ++g) {
+                    uint8_t* blk = hwd_q8.data() + (size_t) n * row_bytes + (size_t) g * 34;
+                    const float d = sdist(qrng) * (1.0f / 256.0f);
+                    const uint16_t dh = encode(d, false);
+                    std::memcpy(blk, &dh, 2);
+                    const float df = decode(dh, false);
+                    for (int j = 0; j < 32; ++j) {
+                        const int8_t q = (int8_t) qdist(qrng);
+                        blk[2 + j] = (uint8_t) q;
+                        hwd_bf16[(size_t) n * K + g * 32 + j] = encode((float) q * df, true);
+                    }
+                }
+            }
+            DeviceBuffer qx(hx.size() * 2), qwd_bf16(hwd_bf16.size() * 2), qwd_q8(hwd_q8.size()), qwi(hwi.size() * 2);
+            DeviceBuffer qlo_ref((size_t) T * nd * 4), qinj_ref((size_t) T * ni * 4);
+            DeviceBuffer qlo_got((size_t) T * nd * 4), qinj_got((size_t) T * ni * 4);
+            HIP_CHECK(hipMemcpyAsync(qx.p, hx.data(), hx.size() * 2, hipMemcpyHostToDevice, stream));
+            HIP_CHECK(hipMemcpyAsync(qwd_bf16.p, hwd_bf16.data(), hwd_bf16.size() * 2, hipMemcpyHostToDevice, stream));
+            HIP_CHECK(hipMemcpyAsync(qwd_q8.p, hwd_q8.data(), hwd_q8.size(), hipMemcpyHostToDevice, stream));
+            HIP_CHECK(hipMemcpyAsync(qwi.p, hwi.data(), hwi.size() * 2, hipMemcpyHostToDevice, stream));
+            const bool ok_ref = strata_pf_hcdown_bf16((const uint16_t*) qx.p, ldx, (const uint16_t*) qwd_bf16.p,
+                                                      (const uint16_t*) qwi.p, nd, ni, (float*) qlo_ref.p,
+                                                      (float*) qinj_ref.p, T, K, stream);
+            const bool ok_got = strata_pf_hcdown_q8_0((const uint16_t*) qx.p, ldx, qwd_q8.p,
+                                                      (const uint16_t*) qwi.p, nd, ni, (float*) qlo_got.p,
+                                                      (float*) qinj_got.p, T, K, stream);
+            if (!ok_ref || !ok_got) {
+                failure_count++;
+                std::fprintf(stderr, "FAIL: strata_pf_hcdown_q8_0 declined\n");
+            } else {
+                std::vector<float> lo_ref((size_t) T * nd), lo_got((size_t) T * nd);
+                std::vector<float> inj_ref((size_t) T * ni), inj_got((size_t) T * ni);
+                HIP_CHECK(hipMemcpyAsync(lo_ref.data(), qlo_ref.p, lo_ref.size() * 4, hipMemcpyDeviceToHost, stream));
+                HIP_CHECK(hipMemcpyAsync(lo_got.data(), qlo_got.p, lo_got.size() * 4, hipMemcpyDeviceToHost, stream));
+                HIP_CHECK(hipMemcpyAsync(inj_ref.data(), qinj_ref.p, inj_ref.size() * 4, hipMemcpyDeviceToHost, stream));
+                HIP_CHECK(hipMemcpyAsync(inj_got.data(), qinj_got.p, inj_got.size() * 4, hipMemcpyDeviceToHost, stream));
+                HIP_CHECK(hipStreamSynchronize(stream));
+                if (std::memcmp(lo_ref.data(), lo_got.data(), lo_ref.size() * 4) != 0 ||
+                    std::memcmp(inj_ref.data(), inj_got.data(), inj_ref.size() * 4) != 0) {
+                    failure_count++;
+                    std::fprintf(stderr, "FAIL: strata_pf_hcdown_q8_0 bitwise mismatch\n");
+                } else {
+                    passed_count++;
+                }
+            }
+        }
+    }
+
     HIP_CHECK(hipStreamDestroy(stream));
 
     if (failure_count > 0) {

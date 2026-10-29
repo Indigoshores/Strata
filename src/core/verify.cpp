@@ -584,6 +584,7 @@ Verifier::~Verifier() {
         slot.compare_exchange_strong(me, nullptr);
     }
     if (cs_) cudaStreamSynchronize(cs_);
+    if (alt_cs_) cudaStreamSynchronize(alt_cs_);
     if (sh_cs_) cudaStreamSynchronize(sh_cs_);
     for (auto& e : exec_)
         if (e) cudaGraphExecDestroy(e);
@@ -600,6 +601,7 @@ Verifier::~Verifier() {
     if (d_spec_) cudaFree(d_spec_);
     if (logit_bias_device_) cudaFree(logit_bias_device_);
     if (cs_ && cs_ != ext_stream_) cudaStreamDestroy(cs_);   // set_stream: the stage's stream, shared, not ours
+    if (alt_cs_) cudaStreamDestroy(alt_cs_);
     if (sh_cs_) cudaStreamDestroy(sh_cs_);
     if (copy_) { cudaStreamSynchronize(copy_); cudaStreamDestroy(copy_); }
     if (side_) cudaStreamDestroy(side_);
@@ -902,6 +904,18 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     else if (make_stream(&cs_) != cudaSuccess) cs_ = nullptr;
     if (cs_ == nullptr || make_stream(&sh_cs_) != cudaSuccess) {
         err = "verify: stream create failed";
+        return false;
+    }
+    {
+        const char* wa = std::getenv("STRATA_WDDM_ALT_STREAM");
+        wddm_alt_stream_ = (wa != nullptr && wa[0] == '1' && ext_stream_ == nullptr);
+        if (wddm_alt_stream_ && make_stream(&alt_cs_) != cudaSuccess) {
+            cudaGetLastError();
+            alt_cs_ = nullptr;
+            wddm_alt_stream_ = false;
+        }
+    }
+    if (false) {
         return false;
     }
     if (cudaEventCreateWithFlags(&commit_done_, cudaEventDisableTiming) != cudaSuccess ||
@@ -3176,7 +3190,7 @@ bool Verifier::commit(int n_keep, std::string& err) {
     h_commit_[0] = n_keep;
     h_commit_[1] = n_keep - 1;
     for (int t = 0; t < max_t_; ++t) h_commit_[2 + t] = t < n_keep ? (int32_t) (last_pos0_ + t) : -1;
-    if (last_t_ == 1 && !always_publish_ && one_token_self_commit()) {
+    if (last_t_ == 1 && !always_publish_ && one_token_self_commit() && !g_qfuse()) {
         // a one-token window has advanced the state itself (record_window): no commit graph
     } else {
         std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -3215,6 +3229,11 @@ bool Verifier::commit(int n_keep, std::string& err) {
             (void) cudaStreamQuery(cs_);
             commit_pending_ = true;
         }
+    }
+    if (wddm_alt_stream_ && alt_cs_ != nullptr && ext_stream_ == nullptr) {
+        if (commit_pending_) cudaStreamWaitEvent(alt_cs_, commit_done_, 0);
+        else cudaStreamSynchronize(cs_);
+        std::swap(cs_, alt_cs_);
     }
     if (ple_stage())   // stages that share one session must advance it once
         for (int t = 0; t < n_keep; ++t) {

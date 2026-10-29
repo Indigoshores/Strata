@@ -3,6 +3,7 @@
 // Arithmetic transcribed from ggml/src/ggml-quants.c at the pinned llama.cpp (MIT License, Copyright (c) 2023-2026
 // The ggml authors): dequantize_row_q2_0/q4_0/q5_0/q8_0/q3_K/q4_K/q5_K/q6_K/iq4_nl/iq4_xs.
 #include "strata/kernels/dequant_bf16.hpp"
+#include "strata/kernels/gfx_arch.hpp"
 #include "strata/core/tc_sm75.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 
@@ -209,7 +210,16 @@ __device__ __forceinline__ uint64_t ld8(const uint8_t* p) {   // 8 bytes at a 2-
 template <int TYPE, typename T>
 __device__ __forceinline__ void wide8(const uint8_t* row_blocks, int gi_in_row, int piece, T* v) {
     const int l0 = 8 * piece;
-    if constexpr (TYPE == 12) {                                    // Q4_K: d dmin scales[12] qs[128]
+    if constexpr (TYPE == 20) {                                    // IQ4_NL: d qs[16]
+        const uint8_t* b = row_blocks + (size_t) gi_in_row * 18;
+        const float d = h2f(b);
+        const uint64_t qs = ld8(b + 2 + 8 * (piece & 1));
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const int lb = (int) (qs >> (8 * k)) & 0xFF;
+            put(v, k, d * (float) kv_iq4nl[piece >= 2 ? (lb >> 4) : (lb & 0xf)]);
+        }
+    } else if constexpr (TYPE == 12) {                             // Q4_K: d dmin scales[12] qs[128]
         const uint8_t* b = row_blocks + (size_t) (gi_in_row / 8) * 144;
         const int gi = gi_in_row % 8, j64 = gi / 2, hi = gi % 2;
         const float d = h2f(b), dmin = h2f(b + 2);
@@ -279,7 +289,7 @@ __global__ void dequant_wide_kernel(const uint8_t* __restrict__ blocks, int64_t 
 #pragma unroll
     for (int k = 0; k < (int) (8 * sizeof(T) / 16); ++k) o[k] = ((const uint4*) v)[k];
 }
-bool wide_type(int type) { return type == 12 || type == 13 || type == 14 || type == 23; }
+bool wide_type(int type) { return type == 12 || type == 13 || type == 14 || type == 20 || type == 23; }
 int g_dequant_wide = -1;   // dequant_set_wide (the parity test); -1 = STRATA_DEQUANT_WIDE, else the card's default
 bool dequant_wide_on() {
     static const int env = [] { const char* v = std::getenv("STRATA_DEQUANT_WIDE"); return v != nullptr && v[0] != '\0' ? (std::atoi(v) != 0 ? 1 : 0) : -1; }();
@@ -292,7 +302,15 @@ bool dequant_wide_on() {
         int major = 0, minor = 0;
         if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
             cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess) { (void) cudaGetLastError(); return false; }
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+        cudaDeviceProp prop;
+        const bool is_gfx11 = (cudaGetDeviceProperties(&prop, dev) == cudaSuccess &&
+                               strata::kernels::gfx_arch_is_gfx11_wmma(prop.gcnArchName)) ||
+                              (major == 11 || major == 12);
+        per_dev[dev] = is_gfx11 ? 2 : 1;
+#else
         per_dev[dev] = (major == 6 && minor == 1) || (major == 8 && minor == 6) ? 2 : 1;
+#endif
     }
     return per_dev[dev] == 2;
 }
@@ -301,7 +319,7 @@ bool dequant_wide_on() {
 // bytes (a thread per block wrote 2-byte values 64 bytes apart: ~110 GB/s, a quarter of a prompt projection's time)
 template <typename T>
 __global__ void dequant_q8_0_kernel(const uint8_t* __restrict__ blocks, int64_t row_bytes, int64_t row0, int64_t rows,
-                                    int64_t groups_per_row, T* __restrict__ out) {
+                                    int64_t groups_per_row, int64_t ld, T* __restrict__ out) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= rows * groups_per_row * 4) return;
     const int64_t g = i >> 2, r = g / groups_per_row, gi = g % groups_per_row;
@@ -316,7 +334,7 @@ __global__ void dequant_q8_0_kernel(const uint8_t* __restrict__ blocks, int64_t 
         put(v, 2 * k, (float) (int8_t) (w & 0xFF) * d);
         put(v, 2 * k + 1, (float) (int8_t) (w >> 8) * d);
     }
-    uint4* o = (uint4*) (out + g * 32 + 8 * piece);
+    uint4* o = (uint4*) (out + r * ld + gi * 32 + 8 * piece);
 #pragma unroll
     for (int k = 0; k < (int) (8 * sizeof(T) / 16); ++k) o[k] = ((const uint4*) v)[k];
 }
@@ -352,9 +370,9 @@ void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t co
     const unsigned grid = (unsigned) ((total + 255) / 256);
     const uint8_t* p = (const uint8_t*) blocks;
     cudaStream_t st = (cudaStream_t) stream;
-    if (type == 8 && ld == cols && (reinterpret_cast<uintptr_t>(blocks) & 1) == 0 &&
+    if (type == 8 && ((size_t) ld * sizeof(T)) % 16 == 0 && (reinterpret_cast<uintptr_t>(blocks) & 1) == 0 &&
         (reinterpret_cast<uintptr_t>(out) & 15) == 0) {   // contiguous rows only (the kernel writes out + g * 32)
-        dequant_q8_0_kernel<T><<<(unsigned) ((4 * total + 255) / 256), 256, 0, st>>>(p, row_bytes, row0, rows, gpr, out);
+        dequant_q8_0_kernel<T><<<(unsigned) ((4 * total + 255) / 256), 256, 0, st>>>(p, row_bytes, row0, rows, gpr, ld, out);
         const cudaError_t e = cudaGetLastError();
         if (e != cudaSuccess) { std::fprintf(stderr, "dequant launch: %s\n", cudaGetErrorString(e)); std::exit(1); }
         return;
@@ -368,6 +386,7 @@ void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t co
         case 12: STRATA_DQW(12);
         case 13: STRATA_DQW(13);
         case 14: STRATA_DQW(14);
+        case 20: STRATA_DQW(20);
         case 23: STRATA_DQW(23);
         }
 #undef STRATA_DQW
@@ -382,7 +401,15 @@ void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t co
                      cudaGetDevice(&dev) == cudaSuccess &&
                      cudaDeviceGetAttribute(&cmaj, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
                      cudaDeviceGetAttribute(&cmin, cudaDevAttrComputeCapabilityMinor, dev) == cudaSuccess &&
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+                     (g_dequant_wide != 0 && ([] (int d, int m) {
+                         cudaDeviceProp pr;
+                         return (cudaGetDeviceProperties(&pr, d) == cudaSuccess &&
+                                 strata::kernels::gfx_arch_is_gfx11_wmma(pr.gcnArchName)) || (m == 11 || m == 12);
+                     }(dev, cmaj)));
+#else
                      strata::core::tc_sm75_enabled(cmaj, cmin);
+#endif
     if (!vec) cudaGetLastError();
 #define STRATA_DQ(TY)                                                                                     \
     if (vec) dequant_kernel<TY, T, true><<<grid, 256, 0, st>>>(p, row_bytes, row0, rows, gpr, ld, out);    \

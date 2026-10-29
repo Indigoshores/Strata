@@ -173,14 +173,18 @@ bool conversation_checkpoint_save(ConversationCheckpoint& c, const SessionState&
     const size_t layers = owned_qsa(ss);
     c.gdn.resize(z.gdn); c.ple.resize(ss.ple_hist ? z.ple : 0);
     c.tails.resize(layers * z.tail); c.dead.resize(layers * z.dead); c.block_pos.resize(layers * z.block_pos);
-    if (!copy(c.gdn.data(), ss.gdn_state, c.gdn.size(), error) ||
-        !copy(c.ple.data(), ss.ple_hist, c.ple.size(), error)) return false;
+    auto qcopy = [&](void* dst, const void* src, size_t bytes) { return copy(dst, src, bytes, error, true); };
+    if (!qcopy(c.gdn.data(), ss.gdn_state, c.gdn.size()) ||
+        !qcopy(c.ple.data(), ss.ple_hist, c.ple.size())) return false;
     for (size_t j = 0; j < layers; ++j) {
         const auto& st = owned(ss, j);
-        if (!copy(c.tails.data() + j * z.tail, st.idx_tail, z.tail, error) ||
-            !copy(c.dead.data() + j * z.dead, st.idx_dead, z.dead, error) ||
-            !copy(c.block_pos.data() + j * z.block_pos, st.idx_block_pos, z.block_pos, error)) return false;
+        if (!qcopy(c.tails.data() + j * z.tail, st.idx_tail, z.tail) ||
+            !qcopy(c.dead.data() + j * z.dead, st.idx_dead, z.dead) ||
+            !qcopy(c.block_pos.data() + j * z.block_pos, st.idx_block_pos, z.block_pos)) return false;
     }
+    cudaStream_t s = nullptr;
+    if (conversation_detail::private_stream(s) != cudaSuccess || cudaStreamSynchronize(s) != cudaSuccess)
+        return fail(error, "checkpoint save stream sync failed");
     return true;
 }
 
@@ -197,18 +201,22 @@ bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionSta
     ConversationStateSizes z;
     if (!conversation_session_sizes(g, ss, z, error)) return false;
     if (!sync(error)) return false;   // the copies below no longer ride the legacy stream's implicit ordering
-    if (!copy(ss.gdn_state, c.gdn.data(), c.gdn.size(), error) ||
-        !copy(ss.ple_hist, c.ple.data(), c.ple.size(), error)) return false;
+    auto qcopy = [&](void* dst, const void* src, size_t bytes) { return copy(dst, src, bytes, error, true); };
+    if (!qcopy(ss.gdn_state, c.gdn.data(), c.gdn.size()) ||
+        !qcopy(ss.ple_hist, c.ple.data(), c.ple.size())) return false;
     for (size_t j = 0; j < owned_qsa(ss); ++j) {
         const auto& st = owned(ss, j);
-        if (!copy(st.idx_tail, c.tails.data() + j * z.tail, z.tail, error) ||
-            !copy(st.idx_dead, c.dead.data() + j * z.dead, z.dead, error) ||
-            !copy(st.idx_block_pos, c.block_pos.data() + j * z.block_pos, z.block_pos, error)) return false;
+        if (!qcopy(st.idx_tail, c.tails.data() + j * z.tail, z.tail) ||
+            !qcopy(st.idx_dead, c.dead.data() + j * z.dead, z.dead) ||
+            !qcopy(st.idx_block_pos, c.block_pos.data() + j * z.block_pos, z.block_pos)) return false;
         if (!c.ids.empty()) {
             const size_t row = c.ids.size() / strata::kernels::qsa_real_shapes().idx_block;
-            if (!copy(st.idx_pooled + row * g.idx_key_dim, c.dead.data() + j * z.dead, z.dead, error)) return false;
+            if (!qcopy(st.idx_pooled + row * g.idx_key_dim, c.dead.data() + j * z.dead, z.dead)) return false;
         }
     }
+    cudaStream_t s = nullptr;
+    if (conversation_detail::private_stream(s) != cudaSuccess || cudaStreamSynchronize(s) != cudaSuccess)
+        return fail(error, "checkpoint restore stream sync failed");
     const size_t tokens = c.ids.size();
     ss.ple_prev[0] = tokens >= 2 ? c.ids[tokens - 2] : -1;
     ss.ple_prev[1] = tokens >= 1 ? c.ids[tokens - 1] : -1;

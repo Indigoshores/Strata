@@ -113,6 +113,31 @@ __host__ __device__ constexpr size_t smem_bytes(int t, int ww, int astages = AST
 
 
 // ---- activations in natural order: one warp per 64 values
+__global__ void quant_act_nat_f16_kernel(const uint16_t* __restrict__ x, int64_t nblk, uint8_t* __restrict__ xa) {
+    const int64_t w = (int64_t) blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    const int lane = threadIdx.x & 31;
+    if (w >= nblk) return;
+    const float v0 = __half2float(__ushort_as_half(x[w * 64 + lane]));
+    const float v1 = __half2float(__ushort_as_half(x[w * 64 + 32 + lane]));
+    float a0 = fabsf(v0), a1 = fabsf(v1);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        a0 = fmaxf(a0, __shfl_xor_sync(0xffffffffu, a0, o));
+        a1 = fmaxf(a1, __shfl_xor_sync(0xffffffffu, a1, o));
+    }
+    uint8_t* out = xa + w * AB;
+    const int c0 = a0 > 0.0f ? __float2int_rn(v0 * (127.0f / a0)) : 0, c1 = a1 > 0.0f ? __float2int_rn(v1 * (127.0f / a1)) : 0;
+    out[lane] = (uint8_t) (int8_t) c0;
+    out[32 + lane] = (uint8_t) (int8_t) c1;
+    int s0 = c0, s1 = c1;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        s0 += __shfl_xor_sync(0xffffffffu, s0, o);
+        s1 += __shfl_xor_sync(0xffffffffu, s1, o);
+    }
+    if (lane == 0) *(float4*) (out + 64) = make_float4(a0 / 127.0f, a1 / 127.0f, (float) s0, (float) s1);
+}
+
 __global__ void quant_act_nat_kernel(const float* __restrict__ x, int64_t nblk, uint8_t* __restrict__ xa) {
     const int64_t w = (int64_t) blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
     const int lane = threadIdx.x & 31;
@@ -823,7 +848,7 @@ native_w11_kernel(const Batch b, const NativeGeom geo, const Tables tb, const ui
                   const int32_t* __restrict__ src, uint8_t* __restrict__ out, float* __restrict__ dm,
                   const float* __restrict__ rw_by_row = nullptr,
                   float* __restrict__ moe_accum = nullptr,
-                  bool tail_dot = true) {
+                  bool tail_dot = true, bool dm_f16 = false) {
 #if STRATA_NAT_WMMA
     constexpr int NS = (GU ? GU_ROWS_K : D_ROWS_K) / 64;  // 64-value stages along K
     constexpr int NFB = (GU ? 1280 : 2560) / NW_ROWS;     // work items per tile
@@ -1092,6 +1117,44 @@ native_w11_kernel(const Batch b, const NativeGeom geo, const Tables tb, const ui
 #pragma unroll
                     for (int nt = 0; nt < NT_TILES; ++nt) {
                         const int r = WN_TOK_STRIDE * wn + 16 * nt + l16;
+#if !STRATA_NAT_W12
+                        if (!moe_accum && dm) {
+                            float* wtile = reinterpret_cast<float*>(&wt[NS & 1][0][0]) + wave * 272;
+#pragma unroll
+                            for (int i = 0; i < 8; ++i) wtile[l16 * 17 + 2 * i + hi] = acc[mt][nt][i];
+                            __builtin_amdgcn_wave_barrier();
+                            const size_t col0 = (size_t) rbase + WM_ROW_STRIDE * wm + 16 * mt;
+                            if (dm_f16) {
+                                const int c_pair = lane & 7, r_sub = lane >> 3;
+#pragma unroll
+                                for (int step = 0; step < 4; ++step) {
+                                    const int t_loc = step * 4 + r_sub;
+                                    const int rr = WN_TOK_STRIDE * wn + 16 * nt + t_loc;
+                                    if (rr < nrows) {
+                                        const float f0 = wtile[t_loc * 17 + 2 * c_pair];
+                                        const float f1 = wtile[t_loc * 17 + 2 * c_pair + 1];
+                                        const float s0 = isnan(f0) ? f0 : fminf(fmaxf(f0, -65504.0f), 65504.0f);
+                                        const float s1 = isnan(f1) ? f1 : fminf(fmaxf(f1, -65504.0f), 65504.0f);
+                                        const uint32_t pk = (uint32_t) __half_as_ushort(__float2half_rn(s0)) |
+                                                            ((uint32_t) __half_as_ushort(__float2half_rn(s1)) << 16);
+                                        *reinterpret_cast<uint32_t*>(reinterpret_cast<uint16_t*>(dm) + (size_t) (row0 + rr) * 2560 + col0 + 2 * c_pair) = pk;
+                                    }
+                                }
+                            } else {
+                                const int c_col = lane & 15, r_sub = lane >> 4;
+#pragma unroll
+                                for (int step = 0; step < 8; ++step) {
+                                    const int t_loc = step * 2 + r_sub;
+                                    const int rr = WN_TOK_STRIDE * wn + 16 * nt + t_loc;
+                                    if (rr < nrows) {
+                                        dm[(size_t) (row0 + rr) * 2560 + col0 + c_col] = wtile[t_loc * 17 + c_col];
+                                    }
+                                }
+                            }
+                            __builtin_amdgcn_wave_barrier();
+                            continue;
+                        }
+#endif
                         if (r < nrows) {
                             if (moe_accum) {
                                 const int dst_t = src ? src[row0 + r] : 0;
@@ -1116,9 +1179,21 @@ native_w11_kernel(const Batch b, const NativeGeom geo, const Tables tb, const ui
                                 d[0] = make_float4(acc[mt][nt][0], acc[mt][nt][1], acc[mt][nt][2], acc[mt][nt][3]);
                                 d[1] = make_float4(acc[mt][nt][4], acc[mt][nt][5], acc[mt][nt][6], acc[mt][nt][7]);
 #else
-                                float* d = dm + (size_t) (row0 + r) * 2560 + rbase + WM_ROW_STRIDE * wm + 16 * mt + hi;
+                                if (dm_f16) {
+                                    uint16_t* d16 = reinterpret_cast<uint16_t*>(dm) + (size_t) (row0 + r) * 2560 + rbase + WM_ROW_STRIDE * wm + 16 * mt + hi;
 #pragma unroll
-                                for (int i = 0; i < 8; ++i) d[2 * i] = acc[mt][nt][i];
+                                    for (int i = 0; i < 8; ++i) {
+                                        const float fv = acc[mt][nt][i];
+                                        const float sv = isnan(fv) ? fv : fminf(fmaxf(fv, -65504.0f), 65504.0f);
+                                        d16[2 * i] = __half_as_ushort(__float2half_rn(sv));
+                                    }
+                                } else {
+                                    float* d = dm + (size_t) (row0 + r) * 2560 + rbase + WM_ROW_STRIDE * wm + 16 * mt + hi;
+#pragma unroll
+                                    for (int i = 0; i < 8; ++i) d[2 * i] = acc[mt][nt][i];
+                                }
+#pragma unroll
+                                for (int i = 0; i < 0; ++i) {}
 #endif
                             }
                         }
@@ -1141,7 +1216,7 @@ native_w11_kernel(const Batch b, const NativeGeom geo, const Tables tb, const ui
 template <int WT, bool GU, int BN>
 __global__ void __launch_bounds__(f16::THREADS)
 native_f16_kernel(const Batch b, const NativeGeom geo, const Tables tb, const uint8_t* __restrict__ act,
-                  const int32_t* __restrict__ src, uint8_t* __restrict__ out, float* __restrict__ dm) {
+                  const int32_t* __restrict__ src, uint8_t* __restrict__ out, float* __restrict__ dm, bool dm_f16 = false) {
 #if STRATA_F16_DEVICE
     // (moe_fused_iq.cu has its own THREADS and AB: the f16 names are qualified where they collide)
     using namespace f16;
@@ -1166,8 +1241,9 @@ native_f16_kernel(const Batch b, const NativeGeom geo, const Tables tb, const ui
     auto* s_act = reinterpret_cast<uint4*>(lds + W_BYTES);
     const int tid = threadIdx.x, wave = tid >> 5, sub_lane = tid & 15;
 
-    int fb, e, row0, nrows;
-    if (!work_item<BN, NFB>(b, tb.ts, tb.tiles, tb.off, blockIdx.x, fb, e, row0, nrows)) return;
+    const int t0_w = tb.ts[b.e0], nwork = (tb.ts[b.e1] - t0_w) * NFB;
+    if (nwork <= 0) return;
+    // setup tables once per CTA before grid-stride work loop
     if constexpr (grid_bytes(WT) > 0) {
         const uint32_t* gs = (const uint32_t*) grid_src<WT>();
         for (int i = tid; i < grid_bytes(WT) / 4; i += f16::THREADS) ((uint32_t*) sgrid)[i] = gs[i];
@@ -1180,6 +1256,9 @@ native_f16_kernel(const Batch b, const NativeGeom geo, const Tables tb, const ui
 #pragma unroll
         for (int k = 0; k < 16; ++k) kv[k >> 2] |= (uint32_t) (uint8_t) kvalues_iq4nl[k] << (8 * (k & 3));
     }
+    for (int w = (int) blockIdx.x; w < nwork; w += (int) gridDim.x) {
+    int fb, e, row0, nrows;
+    if (!work_item<BN, NFB>(b, tb.ts, tb.tiles, tb.off, w, fb, e, row0, nrows)) continue;
     const int live_tiles = (nrows + 15) / 16;
     const uint8_t* blob = b.at(e - b.e0);
     if (tid < BN) srow[tid] = tid < nrows ? (GU ? src[row0 + tid] : row0 + tid) : -1;   // tokens; H by routed row
@@ -1251,7 +1330,9 @@ native_f16_kernel(const Batch b, const NativeGeom geo, const Tables tb, const ui
         __syncthreads();
     }
     if constexpr (GU) gu_epilogue<BN>(acc, lds, tid, live_tiles, nrows, row0, fb, out);
-    else down_epilogue<BN>(acc, lds, tid, live_tiles, nrows, row0, fb, dm);
+    else down_epilogue<BN>(acc, lds, tid, live_tiles, nrows, row0, fb, dm, dm_f16);
+    if (w + (int) gridDim.x < nwork) __syncthreads();
+    }
 #else
     (void) b; (void) geo; (void) tb; (void) act; (void) src; (void) out; (void) dm;
     __builtin_trap();
@@ -1483,6 +1564,13 @@ bool native_supported(int gu_type, int d_type) {
     return requested() || d.w12;
 }
 
+void quantize_act_native_f16(const uint16_t* x_f16, int64_t rows, int64_t cols, void* xa, void* stream) {
+    if (rows <= 0) return;
+    const int64_t nblk = rows * (cols / 64);
+    quant_act_nat_f16_kernel<<<blocks(nblk, 8), 256, 0, (cudaStream_t) stream>>>(x_f16, nblk, (uint8_t*) xa);
+    ck(cudaGetLastError(), "quantize_act_native_f16");
+}
+
 void quantize_act_native(const float* x, int64_t rows, int64_t cols, void* xa, void* stream) {
     if (rows <= 0) return;
     const int64_t nblk = rows * (cols / 64);
@@ -1529,10 +1617,11 @@ template <int BM>
 inline void dispatch_native_d_bm(int d_type, bool occ_d, unsigned grid, const Batch& b, const NativeGeom& g,
                                  const Tables& tb_view, const uint8_t* ha8, const int32_t* src, float* dm,
                                  cudaStream_t s, const float* rw_by_row = nullptr, float* moe_accum = nullptr,
-                                 bool tail_dot = false) {
+                                 bool tail_dot = false, bool dm_f16 = false) {
 #define STRATA_NW_D_CALL(T) do { \
-    if (occ_d) native_w11_kernel<T, false, true, NW_LB, BM><<<grid, NW_THREADS, 0, s>>>(b, g, tb_view, ha8, src, nullptr, dm, rw_by_row, moe_accum, tail_dot); \
-    else native_w11_kernel<T, false, false, 0, BM><<<grid, NW_THREADS, 0, s>>>(b, g, tb_view, ha8, src, nullptr, dm, rw_by_row, moe_accum, tail_dot); \
+    if (occ_d) native_w11_kernel<T, false, true, NW_LB, BM><<<grid, NW_THREADS, 0, s>>>(b, g, tb_view, ha8, src, nullptr, dm, rw_by_row, moe_accum, tail_dot, dm_f16); \
+    else native_w11_kernel<T, false, false, 0, BM><<<grid, NW_THREADS, 0, s>>>(b, g, tb_view, ha8, src, nullptr, dm, rw_by_row, moe_accum, tail_dot, dm_f16); \
+    \
 } while (0)
     if (d_type == T_Q2_0)      STRATA_NW_D_CALL(T_Q2_0);
     else if (d_type == T_Q5_1) STRATA_NW_D_CALL(T_Q5_1);
@@ -1544,7 +1633,7 @@ inline void dispatch_native_d_bm(int d_type, bool occ_d, unsigned grid, const Ba
 
 void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n, const void* scratch, const void* xa,
                     const int32_t* src, void* ha, float* dm, void* stream,
-                    const float* rw_by_row, const int32_t* dst_tok_by_row, float* moe_accum) {
+                    const float* rw_by_row, const int32_t* dst_tok_by_row, float* moe_accum, bool dm_f16) {
     if (b.e1 <= b.e0 || n <= 0) return;
     const DevInfo& d = dev_info();
     if (!d.ok || !gu_covered(g.gu_type) || !d_covered_on(g.d_type, d)) {
@@ -1580,8 +1669,23 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
         const bool tail_dot = moe_tail_dot_enabled();
         const uint8_t* xa8 = (const uint8_t*) xa;
         uint8_t* ha8 = (uint8_t*) ha;
-        const bool f16 = !d.w12 && f16::requested();
-        if (!f16 && !d.w12 && moe_var_bm_enabled()) {
+        static const int64_t pf_f16_min_t = [] {
+            const char* v = std::getenv("STRATA_PF_F16_MIN_T");
+            return v && v[0] != '\0' ? (int64_t) std::atoll(v) : (int64_t) 0;
+        }();
+        static const bool pf_f16_var_bm = [] {
+            const char* v = std::getenv("STRATA_PF_F16_VAR_BM");
+            return v != nullptr && v[0] == '1';
+        }();
+        const int64_t prompt_t = n / 10;
+        const bool f16 = !d.w12 && f16::requested() && (pf_f16_min_t <= 0 || prompt_t >= pf_f16_min_t);
+        static const int var_bm_max_avg = [] {
+            const char* v = std::getenv("STRATA_MOE_VAR_BM_MAX_AVG");
+            return v && v[0] != '\0' ? std::atoi(v) : 128;
+        }();
+        const double avg_rows = (double) n / std::max(n_expert, 1);
+        if ((!f16 || pf_f16_var_bm) && !d.w12 && moe_var_bm_enabled() && (avg_rows < (double) var_bm_max_avg)) {
+            const bool f16_wide = f16::pick_bn(n, n_expert) == 2 * kTileRows;
             const int max_bm = pick_max_bm(n, n_expert);
             const int64_t t_cap64 = (max_bm >= 64 && n >= 49) ? ((n + 48) / 49 + (b.e1 - b.e0)) : 0;
             const int64_t t_cap32 = (max_bm >= 32 && n >= 17) ? ((max_bm == 32) ? ((n + 31) / 32 + (b.e1 - b.e0)) : std::min<int64_t>(b.e1 - b.e0, (n + 16) / 17)) : 0;
@@ -1597,7 +1701,24 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
             // Gate/Up: B64 -> B32 -> B16
             if (t_cap64 > 0) {
                 const unsigned g_gu_64 = (unsigned) std::min<int64_t>(t_cap64 * (1280 / NW_ROWS), (int64_t) d.sms * blk_gu);
-                dispatch_native_gu_bm<64>(g.gu_type, occ_gu, g_gu_64, b, g, tb64, xa8, src, ha8, s);
+                if (f16 && f16_gu(g.gu_type)) {
+                    const unsigned gf64 = (unsigned) std::max<int64_t>(1, std::min<int64_t>(t_cap64 * f16::GU_NFB, (int64_t) d.sms * (f16_wide ? 3 : 4)));
+#define STRATA_F16_GU64(T) do { \
+    if (f16_wide) native_f16_kernel<T, true, 2 * kTileRows><<<gf64, f16::THREADS, 0, s>>>(b, g, tb64, xa8, src, ha8, nullptr, false); \
+    else native_f16_kernel<T, true, kTileRows><<<gf64, f16::THREADS, 0, s>>>(b, g, tb64, xa8, src, ha8, nullptr, false); \
+} while (0)
+                    switch (g.gu_type) {
+                        case T_IQ2_XXS: STRATA_F16_GU64(T_IQ2_XXS); break;
+                        case T_IQ2_XS:  STRATA_F16_GU64(T_IQ2_XS); break;
+                        case T_IQ2_S:   STRATA_F16_GU64(T_IQ2_S); break;
+                        case T_IQ3_XXS: STRATA_F16_GU64(T_IQ3_XXS); break;
+                        case T_IQ3_S:   STRATA_F16_GU64(T_IQ3_S); break;
+                        default:        STRATA_F16_GU64(T_IQ4_XS); break;
+                    }
+#undef STRATA_F16_GU64
+                } else {
+                    dispatch_native_gu_bm<64>(g.gu_type, occ_gu, g_gu_64, b, g, tb64, xa8, src, ha8, s);
+                }
             }
             if (t_cap32 > 0) {
                 const unsigned g_gu_32 = (unsigned) std::min<int64_t>(t_cap32 * (1280 / NW_ROWS), (int64_t) d.sms * blk_gu);
@@ -1611,15 +1732,27 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
             // Down: B64 -> B32 -> B16
             if (t_cap64 > 0) {
                 const unsigned g_d_64 = (unsigned) std::min<int64_t>(t_cap64 * (2560 / NW_ROWS), (int64_t) d.sms * blk_d);
-                dispatch_native_d_bm<64>(g.d_type, occ_d, g_d_64, b, g, tb64, ha8, eff_src, dm, s, rw_by_row, moe_accum, tail_dot);
+                if (f16 && f16_d(g.d_type) && !moe_accum) {
+                    const unsigned gdf64 = (unsigned) std::max<int64_t>(1, std::min<int64_t>(t_cap64 * f16::D_NFB, (int64_t) d.sms * (f16_wide ? 3 : 4)));
+#define STRATA_F16_D64(T) do { \
+    if (f16_wide) native_f16_kernel<T, false, 2 * kTileRows><<<gdf64, f16::THREADS, 0, s>>>(b, g, tb64, ha8, src, nullptr, dm, dm_f16); \
+    else native_f16_kernel<T, false, kTileRows><<<gdf64, f16::THREADS, 0, s>>>(b, g, tb64, ha8, src, nullptr, dm, dm_f16); \
+} while (0)
+                    if (g.d_type == T_Q2_0) STRATA_F16_D64(T_Q2_0);
+                    else if (g.d_type == T_Q8_0) STRATA_F16_D64(T_Q8_0);
+                    else STRATA_F16_D64(T_IQ4_NL);
+#undef STRATA_F16_D64
+                } else {
+                    dispatch_native_d_bm<64>(g.d_type, occ_d, g_d_64, b, g, tb64, ha8, eff_src, dm, s, rw_by_row, moe_accum, tail_dot, dm_f16);
+                }
             }
             if (t_cap32 > 0) {
                 const unsigned g_d_32 = (unsigned) std::min<int64_t>(t_cap32 * (2560 / NW_ROWS), (int64_t) d.sms * blk_d);
-                dispatch_native_d_bm<32>(g.d_type, occ_d, g_d_32, b, g, tb32, ha8, eff_src, dm, s, rw_by_row, moe_accum, tail_dot);
+                dispatch_native_d_bm<32>(g.d_type, occ_d, g_d_32, b, g, tb32, ha8, eff_src, dm, s, rw_by_row, moe_accum, tail_dot, dm_f16);
             }
             if (t_cap16 > 0) {
                 const unsigned g_d_16 = (unsigned) std::min<int64_t>(t_cap16 * (2560 / NW_ROWS), (int64_t) d.sms * blk_d);
-                dispatch_native_d_bm<16>(g.d_type, occ_d, g_d_16, b, g, tb16, ha8, eff_src, dm, s, rw_by_row, moe_accum, tail_dot);
+                dispatch_native_d_bm<16>(g.d_type, occ_d, g_d_16, b, g, tb16, ha8, eff_src, dm, s, rw_by_row, moe_accum, tail_dot, dm_f16);
             }
 
             ck(cudaGetLastError(), "experts_native");
@@ -1634,9 +1767,12 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
         // f16_gu / f16_d (gfx12's WMMA layout differs, so it keeps the int8 kernels)
         const bool f16_wide = f16::pick_bn(n, n_expert) == 2 * kTileRows;
 #define STRATA_F16_LAUNCH(T, GU, NFB, ACT, OUT, DM) do { \
-    const unsigned grid_f = (unsigned) std::max<int64_t>(1, tiles * (NFB)); \
-    if (f16_wide) native_f16_kernel<T, GU, 2 * kTileRows><<<grid_f, f16::THREADS, 0, s>>>(b, g, tb, ACT, src, OUT, DM); \
-    else native_f16_kernel<T, GU, kTileRows><<<grid_f, f16::THREADS, 0, s>>>(b, g, tb, ACT, src, OUT, DM); \
+    const int64_t nb_e = b.e1 - b.e0; \
+    const int64_t b_rows_est = (n * nb_e + std::max(n_expert, 1) - 1) / std::max(n_expert, 1); \
+    const int64_t b_tiles_est = std::min<int64_t>(tiles, (b_rows_est + kTileRows - 1) / kTileRows + nb_e + 64); \
+    const unsigned grid_f = (unsigned) std::max<int64_t>(1, std::min<int64_t>(b_tiles_est * (NFB), (int64_t) d.sms * (f16_wide ? 3 : 4))); \
+    if (f16_wide) native_f16_kernel<T, GU, 2 * kTileRows><<<grid_f, f16::THREADS, 0, s>>>(b, g, tb, ACT, src, OUT, DM, dm_f16); \
+    else native_f16_kernel<T, GU, kTileRows><<<grid_f, f16::THREADS, 0, s>>>(b, g, tb, ACT, src, OUT, DM, dm_f16); \
 } while (0)
         if (f16 && f16kq::covers(g.gu_type)) f16kq::gate_up(b, g, tb.ts, tb.tiles, tb.off, n, n_expert, tiles, xa8, src, ha8, s);
         else if (f16 && f16_gu(g.gu_type)) {
@@ -1662,9 +1798,9 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
             default: STRATA_NW_GU(T_IQ4_XS); break;
         }
 #undef STRATA_NW_GU
-#define STRATA_NW_D(T) do { if (occ_d) native_w11_kernel<T, false, true, NW_LB><<<g_d, NW_THREADS, 0, s>>>(b, g, tb, ha8, eff_src, nullptr, dm, rw_by_row, moe_accum, tail_dot); else native_w11_kernel<T, false><<<g_d, NW_THREADS, 0, s>>>(b, g, tb, ha8, eff_src, nullptr, dm, rw_by_row, moe_accum, tail_dot); } while (0)
-        if (f16 && f16kq::covers_down(g.d_type)) f16kq::down(b, g, tb.ts, tb.tiles, tb.off, n, n_expert, tiles, ha8, dm, s);
-        else if (f16 && f16_d(g.d_type)) {
+#define STRATA_NW_D(T) do { if (occ_d) native_w11_kernel<T, false, true, NW_LB><<<g_d, NW_THREADS, 0, s>>>(b, g, tb, ha8, eff_src, nullptr, dm, rw_by_row, moe_accum, tail_dot, dm_f16); else native_w11_kernel<T, false><<<g_d, NW_THREADS, 0, s>>>(b, g, tb, ha8, eff_src, nullptr, dm, rw_by_row, moe_accum, tail_dot, dm_f16); } while (0)
+        if (f16 && f16kq::covers_down(g.d_type) && !moe_accum) f16kq::down(b, g, tb.ts, tb.tiles, tb.off, n, n_expert, tiles, ha8, dm, s, dm_f16);
+        else if (f16 && f16_d(g.d_type) && !moe_accum) {
             if (g.d_type == T_Q2_0) STRATA_F16_LAUNCH(T_Q2_0, false, f16::D_NFB, ha8, nullptr, dm);
             else if (g.d_type == T_Q8_0) STRATA_F16_LAUNCH(T_Q8_0, false, f16::D_NFB, ha8, nullptr, dm);
             else STRATA_F16_LAUNCH(T_IQ4_NL, false, f16::D_NFB, ha8, nullptr, dm);

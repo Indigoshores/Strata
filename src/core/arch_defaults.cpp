@@ -26,6 +26,7 @@ std::vector<std::pair<std::string, std::string>> arch_default_env(const char* gc
             {"STRATA_GDN_CONVL2", "1"},
             {"STRATA_GDN_NOY", "1"},
             {"STRATA_CVEC_FUSE", "1"},
+            {"STRATA_DEQUANT_WIDE", "1"},
         };
         return t;
     }
@@ -42,6 +43,7 @@ std::vector<std::pair<std::string, std::string>> arch_default_env(const char* gc
         {"STRATA_CVEC_FUSE", "1"},       // a steered layer's write, control vector and next norm in one pass (S23)
         {"STRATA_HCD_EXACT", "1"},       // the HC down GEMM in hipBLASLt solution 1176's k order: 64K +1.8% (stream S)
         {"STRATA_PF_PAD", "1"},          // padded GEMM row strides (acts with STRATA_PF_GEMM; inert without it) (S23)
+        {"STRATA_DEQUANT_WIDE", "1"},    // coalesced 16-byte uint4 wide dequantization for Q4_K/Q5_K/Q6_K/IQ4_NL/IQ4_XS (bitwise exact)
         {"STRATA_TOPK_REG_MIN_BLOCKS", "4096"},   // the register top-k from 16K cells, not 28K: same ids; per 2,048 queries the ref takes 1.0 / 2.4 / 3.9 ms at 16K / 20K / 24K cells, the scan 0.87 / 0.93 / 1.00
         // decode
         {"STRATA_Q8_PACKED", "1"},       // the packed Q8_0 decode layout: +2.3% (S26)
@@ -55,11 +57,15 @@ std::vector<std::pair<std::string, std::string>> arch_default_env(const char* gc
         {"STRATA_QFUSE", "1"},           // activation q8_1 images written by their producers (S26)
         {"STRATA_PLE_BATCH", "1"},       // the verify window's PLE key / value projections at once (S25)
 #if defined(_WIN32)
+        {"STRATA_PF_Z_STREAM", "0"},     // Windows WDDM: avoid 72 cross-stream event barriers/chunk in GDN prefill
+        {"STRATA_PF_SH_STREAM", "0"},    // Windows WDDM: avoid 96 cross-stream event barriers/chunk in shared expert (-813 ms at 16K)
         {"STRATA_SH_STREAM", "0"},       // Windows WDDM: single-stream decode yields +16.4% decode speed (Phase 1)
 #else
+        {"STRATA_PF_Z_STREAM", "1"},     // non-Windows: GDN Z-projection side-stream overlap (Gufo #758 da4d8b82)
+        {"STRATA_PF_SH_STREAM", "1"},    // non-Windows: overlap shared expert GEMMs on side_stream for T >= 1024
         {"STRATA_SH_STREAM", "1"},       // the shared expert on its own stream: decode +1.8% / +6.7% (UD-Q4_K_XL) (140-m)
 #endif
-        {"STRATA_PF_Z_STREAM", "1"},     // GDN Z-projection side-stream overlap (Gufo #758 da4d8b82)
+
         {"STRATA_GDN_CHUNKED", "1"},     // chunked DeltaNet recurrence on gfx11 matrix cores (Gufo #758 29e900c9)
         {"STRATA_WDDM_FLUSH", "0"},      // Pass 5B.4: 0 avoids unnecessary synchronous WDDM flush overhead
         {"STRATA_MOE_MAX_BM", "64"},     // Pass 5B.4: grouped MoE max block multiple
@@ -69,9 +75,13 @@ std::vector<std::pair<std::string, std::string>> arch_default_env(const char* gc
         {"STRATA_QFUSE_HC", "1"},        // graph fusion: Q-fuse HC
         {"STRATA_ADMIT_MERGE_FIRST", "1"},// merge trailing prompt header tokens into first verify window
         {"STRATA_CKPT_POOL", "1"},       // reuse conversation checkpoint vector buffers
-        {"STRATA_PF_SWITCH_MIN_T", "128"},// warmup WMMA GEMM / hipBLASLt plans for chunked prefill
+        {"STRATA_PF_SWITCH_MIN_T", "16"}, // warmup WMMA GEMM / hipBLASLt plans for chunked prefill (including T=31 tail chunk)
+
         {"STRATA_PF_FUSED", "1"},        // zero-sync GPU fused experts prefill
-        {"STRATA_PF_F16", "0"},          // INT8 native experts prefill (Stage 5B.1 beats FP16 on gfx1151)
+        {"STRATA_PF_F16", "1"},          // FP16 WMMA matrix-core experts prefill (-25.0% MoE wall time on gfx1151, 105/105 parity)
+        {"STRATA_REFILL_PARTS", "1"},    // eliminate CPU staging buffer assembly during refill
+        {"STRATA_EAGER_PARK", "1"},      // eager background conversation parking
+        {"STRATA_PF_DM_F16", "1"},       // FP16 MoE down-projection scratch bandwidth reduction
         {"STRATA_PREFILL_STREAM_MIN", "16"}, // stream all experts for T >= 16 on gfx1151
         {"STRATA_PF_MOE_SCATTER", "0"},  // combine directly via m.Dm (avoids atomicAdd contention)
         {"STRATA_PF_HC_WMMA_Q8", "0"},   // disable prefill HC WMMA Q8 fallback

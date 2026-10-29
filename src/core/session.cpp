@@ -198,6 +198,7 @@ void stage_token(const ModelGeometry& g, int64_t pos, int32_t pos_base, SessionS
         QsaState& q = s.qsa_states[s.qsa_ord0 + j];
         qsa_step_fill(q.host_step, pos, sh);
         for (int64_t h = 0; h < g.n_head; ++h) q.host_pos[h] = (int32_t) (pos_base + pos);
+        if (q.dirty_cells < pos_base + pos + 1) q.dirty_cells = pos_base + pos + 1;
     }
 }
 

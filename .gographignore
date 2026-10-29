@@ -1,0 +1,20 @@
+# Scope gograph AST indexing strictly to Go harness packages (docs-strix-go/)
+# Prevents cold 12,496-file repo scans across C++/CUDA sources, build trees, and logs
+build*/
+graphify-out/
+.agents/
+.harness/
+third_party/
+serve/
+pack/
+tools/
+docs/
+src/
+include/
+tests/
+*.log
+*.gguf
+*.bin
+*.exe
+*.obj
+*.o

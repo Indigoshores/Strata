@@ -31,6 +31,7 @@ bool native_supported(int gu_type, int d_type);
 
 /// x [rows][cols] FP32 -> `xa` (act_bytes(rows, cols)): int8 per 32 values in natural order, the native kernels' form.
 void quantize_act_native(const float* x, int64_t rows, int64_t cols, void* xa, void* stream);
+void quantize_act_native_f16(const uint16_t* x_f16, int64_t rows, int64_t cols, void* xa, void* stream);
 
 /// experts() for native blobs: b.blob[e - e0] is the native blob of expert e (gate at 0, up at g.up_off, down at
 /// g.down_off; 2-byte aligned).  `xa` from quantize_act_native; H in `ha` (act_bytes(n, 640)); down into `dm` at the
@@ -39,6 +40,6 @@ void quantize_act_native(const float* x, int64_t rows, int64_t cols, void* xa, v
 void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n, const void* scratch, const void* xa,
                     const int32_t* src, void* ha, float* dm, void* stream,
                     const float* rw_by_row = nullptr, const int32_t* dst_tok_by_row = nullptr,
-                    float* moe_accum = nullptr);
+                    float* moe_accum = nullptr, bool dm_f16 = false);
 
 }  // namespace strata::prefill::fused

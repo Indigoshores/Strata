@@ -110,11 +110,11 @@ bool valid(const QsaState& st, const Layout& l, int64_t upto, std::string& error
     return true;
 }
 
-bool transfer(void* dst, const void* src, size_t n, std::string& error) {
+bool transfer(void* dst, const void* src, size_t n, std::string& error, bool queued = false) {
     if (!n) return true;
     if (!src || !dst) { error = "conversation snapshot: missing state buffer"; return false; }
     // Default handles both device allocations and device-mapped host pool aliases.
-    const cudaError_t e = conversation_detail::copy_nonblocking(dst, src, n);
+    const cudaError_t e = conversation_detail::copy_nonblocking(dst, src, n, queued);
     if (e == cudaSuccess) return true;
     error = std::string("conversation snapshot copy: ") + cudaGetErrorString(e);
     return false;
@@ -173,9 +173,18 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
         if (keep > dst[i]->size()) { error = "conversation snapshot: missing reusable prefix"; return false; }
         dst[i]->resize(sizes[i]);
         if (!dst[i]->visit(keep, sizes[i] - keep, [&](uint8_t* p, size_t n, size_t at) {
-                return transfer(p, src[i] ? static_cast<const uint8_t*>(src[i]) + at : nullptr, n, error);
+                return transfer(p, src[i] ? static_cast<const uint8_t*>(src[i]) + at : nullptr, n, error, true);
             })) return false;
         if (reused_bytes) *reused_bytes += keep;
+    }
+    cudaStream_t s = nullptr;
+    if (conversation_detail::private_stream(s) == cudaSuccess && s != nullptr) {
+        const cudaError_t se = cudaStreamSynchronize(s);
+        if (se != cudaSuccess) {
+            error = std::string("conversation snapshot sync: ") + cudaGetErrorString(se);
+            return false;
+        }
+        core::progress_beat();
     }
     return true;
 }

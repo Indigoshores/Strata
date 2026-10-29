@@ -229,6 +229,7 @@ struct QsaState {
     int32_t* page_table = nullptr;   ///< (n_pages,) logical page -> physical page (-1: not resident, streamed)
     int64_t n_pages = 0;
     int64_t max_cells = 0;
+    mutable int64_t dirty_cells = 0;
 
     /// KV STREAMING (docs/kv-streaming-design.md, `kv_stream.hpp`). `kv_mode` 0: every page in VRAM, identity
     /// table (n_slots == n_pages, no host copy). 1: streamed - the authoritative K/V in `host`, `n_slots` pages

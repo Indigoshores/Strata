@@ -9203,6 +9203,7 @@ int main(int argc, char** argv) {
                 return true;
             }
         };
+        bool live_parked = false;
         int64_t pp_total = 0, pp_from = 0, pp_next_check = 0;
         bool pp_tail_saved = false;
         // #471: the position the prompt pass has read up to (a chunk's or a window's end): what a request cancelled
@@ -12273,11 +12274,12 @@ int main(int argc, char** argv) {
                         return 1;
                     }
                 }
-            } else if ((!from_live || incoming || slot_source >= 0) && !pin_sibling && park_worth &&
+            } else if (!from_live && (!live_parked || incoming) && !pin_sibling && park_worth &&
                        !park_current(incoming ? incoming->bytes() : 0)) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
+            live_parked = false;
             if (slot_source >= 0) {
                 lent_slot = -1;   // (a longer start than the main session's)
                 const auto t0 = Clock::now();
@@ -13472,14 +13474,18 @@ int main(int argc, char** argv) {
             // (the conversation so far), a checkpoint there, then the new turn's header.  The next request of the same
             // chat renders the same history - but not always the same header or the thinking of this reply - so that
             // checkpoint is the one it reuses.
+            static const bool no_turn_split = [] {
+                const char* v = std::getenv("STRATA_NO_TURN_SPLIT");
+                return v != nullptr && v[0] != '0';
+            }();
             int64_t turn_at = -1;
-            if (o.prompt_cache > 0 && o.turn_token >= 0)
+            if (!no_turn_split && o.prompt_cache > 0 && o.turn_token >= 0)
                 for (int64_t i = n - 1; i > resume; --i)
                     if (ids[(size_t) i] == o.turn_token) { turn_at = i; break; }
             // #458 (opt-in): a short turn of --tail-role-token's role right before the new assistant turn (the
             // server's trailing reasoning-effort turn) stays out of the checkpoint, so the next request - another
             // effort, or the next turn of the chat - finds the conversation without it
-            if (turn_at > 0 && o.tail_role_token >= 0)
+            if (!no_turn_split && turn_at > 0 && o.tail_role_token >= 0)
                 for (int64_t i = turn_at - 1; i > resume; --i)
                     if (ids[(size_t) i] == o.turn_token) {
                         if (ids[(size_t) i + 1] == o.tail_role_token) turn_at = i;
@@ -13504,7 +13510,7 @@ int main(int argc, char** argv) {
                 return e != nullptr && std::atoi(e) != 0;
             }();
             // Only add a snapshot; the existing token and image checks still decide reuse.
-            const int64_t message_at = message_checkpoint && !multi_gpu && o.prompt_cache > 0
+            const int64_t message_at = !no_turn_split && message_checkpoint && !multi_gpu && o.prompt_cache > 0
                 ? strata::program::message_checkpoint_boundary(ids, resume, turn_at, o.turn_token) : -1;
             // pin=N (opt-in): one more place the prompt is read to and checkpointed.  One pinned prefix at a time: a
             // new pin replaces the old; it needs room for the root, the pin and a rotating checkpoint
@@ -15217,6 +15223,7 @@ int main(int argc, char** argv) {
                 helper_blobs_before = blobs;
                 helper_bytes_before = bytes;
             }
+            if (park_current(0)) live_parked = true;
         }
         save_profile("exit");   // #477: QUIT, or the server closed stdin
 #if defined(STRATA_GPU_METAL)

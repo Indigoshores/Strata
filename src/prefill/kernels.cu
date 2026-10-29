@@ -145,7 +145,7 @@ __global__ void gr_norm_rs_kernel(const float* __restrict__ R, const float* __re
 }
 __global__ void gr_mix_r_kernel(const float* __restrict__ R, const float* __restrict__ rs, const float* __restrict__ w,
                                 const float* __restrict__ g, float* __restrict__ mixed, uint16_t* __restrict__ mixed16,
-                                int64_t T, uint16_t* __restrict__ mixed_h, uint16_t* __restrict__ mixed16_lo) {
+                                int64_t T, uint16_t* __restrict__ mixed_h, uint16_t* __restrict__ mixed16_lo, int64_t mh_ld) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= T * N) return;
     const int64_t t = i / N, d = i % N;
@@ -163,7 +163,7 @@ __global__ void gr_mix_r_kernel(const float* __restrict__ R, const float* __rest
         mixed16[i] = h;
         if (mixed16_lo) mixed16_lo[i] = bf_lo(s, h);
     }
-    if (mixed_h) mixed_h[i] = hf(s);
+    if (mixed_h) mixed_h[t * mh_ld + d] = hf(s);
 }
 // F-2: gr_write_kernel for one row (t, c), then gr_norm_rs_kernel's reduction over it with the next half's norm
 // weights - the same thread-to-element mapping (256 threads, stride 256) and block_sum, so rs and the BF16 image are
@@ -276,7 +276,7 @@ __global__ void gr_silu_kernel(const float* __restrict__ lo, uint16_t* __restric
 }
 __global__ void gr_mix_kernel(const float* __restrict__ xn, const float* __restrict__ g, float* __restrict__ mixed,
                               uint16_t* __restrict__ mixed16, int64_t T, uint16_t* __restrict__ mixed_h,
-                              uint16_t* __restrict__ mixed16_lo) {
+                              uint16_t* __restrict__ mixed16_lo, int64_t mh_ld) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= T * N) return;
     const int64_t t = i / N, d = i % N;
@@ -293,7 +293,7 @@ __global__ void gr_mix_kernel(const float* __restrict__ xn, const float* __restr
         mixed16[i] = h;
         if (mixed16_lo) mixed16_lo[i] = bf_lo(s, h);
     }
-    if (mixed_h) mixed_h[i] = hf(s);
+    if (mixed_h) mixed_h[t * mh_ld + d] = hf(s);
 }
 __global__ void gr_write_kernel(float* __restrict__ R, const float* __restrict__ bo, const float* __restrict__ inj,
                                 int64_t inj_ld, int64_t T) {
@@ -369,18 +369,25 @@ __global__ void gdn_conv_l2_kernel(const float* __restrict__ hist, const float* 
     auto input = [&](int64_t t) -> float { return t >= 0 ? qkv[t * C + c] : hist[c * 3 + (int) (t + 3)]; };
     float v0 = input(t0 - 3), v1 = input(t0 - 2), v2 = input(t0 - 1);
     const float w0 = w[c * 4], w1 = w[c * 4 + 1], w2 = w[c * 4 + 2], w3 = w[c * 4 + 3];
-    for (int64_t t = t0; t < t1; ++t) {   // gdn_conv_tiled_kernel's loop, verbatim
+    if (blockIdx.x >= 2 * HK) {   // v channels: no norm, single write to global DRAM
+        for (int64_t t = t0; t < t1; ++t) {
         const float x = qkv[t * C + c];
         const float s = v0 * w0 + v1 * w1 + v2 * w2 + x * w3;
         h[t * C + c] = s / (1.0f + __expf(-s));
         v0 = v1; v1 = v2; v2 = x;
     }
-    if (blockIdx.x >= 2 * HK) return;   // v channels: no norm
+        return;
+    }
     __shared__ float part[16][4];
     for (int64_t tb = t0; tb < t1; tb += 16) {
         const int n = (int) (t1 - tb < 16 ? t1 - tb : 16);
-        for (int j = 0; j < n; ++j) {   // (each thread reads back its own stored value)
-            const float v = h[(tb + j) * C + c];
+        float hv[16];
+        for (int j = 0; j < n; ++j) {
+            const float x = qkv[(tb + j) * C + c];
+            const float s = v0 * w0 + v1 * w1 + v2 * w2 + x * w3;
+            const float v = s / (1.0f + __expf(-s));
+            hv[j] = v;
+            v0 = v1; v1 = v2; v2 = x;
             // gdn_l2_kernel as the compiler built it: the first xor step adds the partner's rounded square to an
             // unrounded own one (an fma), the other steps are plain adds - spelled out so no contraction can differ
             float sq = __fmaf_rn(v, v, __shfl_xor_sync(0xffffffffu, __fmul_rn(v, v), 16));
@@ -391,7 +398,7 @@ __global__ void gdn_conv_l2_kernel(const float* __restrict__ hist, const float* 
         __syncthreads();
         for (int j = 0; j < n; ++j) {
             const float ss = part[j][0] + part[j][1] + part[j][2] + part[j][3];
-            h[(tb + j) * C + c] = h[(tb + j) * C + c] * rsqrtf(ss + eps);
+            h[(tb + j) * C + c] = hv[j] * rsqrtf(ss + eps);
         }
         __syncthreads();
     }
@@ -1991,12 +1998,12 @@ __global__ void swiglu_pair_kernel(const float* __restrict__ g, const float* __r
     h16[i] = hf_sat(a / (1.0f + __expf(-a)) * u[i]);
 }
 __global__ void gather_rows16_kernel(const uint16_t* __restrict__ x, const int32_t* __restrict__ src,
-                                     uint16_t* __restrict__ dst, int64_t n, int64_t width) {
+                                     uint16_t* __restrict__ dst, int64_t n, int64_t width, int64_t src_ld) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;   // one uint4 (8 bf16)
-    const int64_t per = width / 8;
+    const int64_t per = width / 8, src_per = src_ld / 8;
     if (i >= n * per) return;
     const int64_t r = i / per, j = i % per;
-    reinterpret_cast<uint4*>(dst)[r * per + j] = reinterpret_cast<const uint4*>(x)[(int64_t) src[r] * per + j];
+    reinterpret_cast<uint4*>(dst)[r * per + j] = reinterpret_cast<const uint4*>(x)[(int64_t) src[r] * src_per + j];
 }
 __global__ void moe_combine_kernel(const float* __restrict__ Dm, const int32_t* __restrict__ slot,
                                    const float* __restrict__ w, const float* __restrict__ shared,
@@ -2051,6 +2058,107 @@ __global__ void moe_combine4_kernel(const float* __restrict__ Dm, const int32_t*
     const float g = sigm(sg[t]);
     const float4 sh = shared[i];
     bo[i] = make_float4(s.x + sh.x * g, s.y + sh.y * g, s.z + sh.z * g, s.w + sh.w * g);
+}
+
+__global__ void moe_combine_f16_kernel(const uint16_t* __restrict__ Dm16, const int32_t* __restrict__ slot,
+                                       const float* __restrict__ w, const float* __restrict__ shared,
+                                       const float* __restrict__ sg, float* __restrict__ bo, int64_t T) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= T * N) return;
+    const int64_t t = i / N, d = i % N;
+    float s = 0.0f;
+    for (int k = 0; k < 10; ++k) {
+        const float wk = w[t * 10 + k];
+        if (wk == 0.0f) continue;
+        const int64_t r = slot[t * 10 + k];
+        const float v = __half2float(__ushort_as_half(Dm16[(size_t) r * N + d]));
+        s = fmaf(wk, v, s);
+    }
+    bo[i] = s + shared[i] * sigm(sg[t]);
+}
+
+__global__ void moe_combine_f16_4_kernel(const uint16_t* __restrict__ Dm16, const int32_t* __restrict__ slot,
+                                         const float* __restrict__ w, const float4* __restrict__ shared,
+                                         const float* __restrict__ sg, float4* __restrict__ bo, int64_t T) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= T * (N / 4)) return;
+    const int64_t t = i / (N / 4), d = (i % (N / 4)) * 4;
+    float4 s = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+#pragma unroll
+    for (int k = 0; k < 10; ++k) {
+        const float wk = w[t * 10 + k];
+        if (wk == 0.0f) continue;
+        const int64_t r = slot[t * 10 + k];
+        const uint2 u = *reinterpret_cast<const uint2*>(Dm16 + (size_t) r * N + d);
+        const float v0 = __half2float(__ushort_as_half((uint16_t) (u.x & 0xFFFFu)));
+        const float v1 = __half2float(__ushort_as_half((uint16_t) (u.x >> 16)));
+        const float v2 = __half2float(__ushort_as_half((uint16_t) (u.y & 0xFFFFu)));
+        const float v3 = __half2float(__ushort_as_half((uint16_t) (u.y >> 16)));
+        s.x = fmaf(wk, v0, s.x); s.y = fmaf(wk, v1, s.y);
+        s.z = fmaf(wk, v2, s.z); s.w = fmaf(wk, v3, s.w);
+    }
+    const float g = sigm(sg[t]);
+    const float4 sh = shared[i];
+    bo[i] = make_float4(s.x + sh.x * g, s.y + sh.y * g, s.z + sh.z * g, s.w + sh.w * g);
+}
+
+__global__ void __launch_bounds__(256) moe_combine_f16_write_norm_rs_kernel(
+    float* __restrict__ R, const uint16_t* __restrict__ Dm16, const int32_t* __restrict__ slot,
+    const float* __restrict__ w, const float* __restrict__ shared, const float* __restrict__ sg,
+    const float* __restrict__ inj, int64_t inj_ld, const float* __restrict__ w_norm, float eps,
+    float* __restrict__ rs_out, uint16_t* __restrict__ xn16, uint16_t* __restrict__ xn16_lo,
+    int64_t ldx, int f16img, int64_t T) {
+    __shared__ __align__(16) float s_bo[N];
+    __shared__ float sh[32];
+    const int64_t t = blockIdx.x;
+    if (t >= T) return;
+    const float g = sigm(sg[t]);
+    for (int g4 = threadIdx.x; g4 < N / 4; g4 += 256) {
+        const int d = 4 * g4;
+        float4 s = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+#pragma unroll
+        for (int k = 0; k < 10; ++k) {
+            const float wk = w[t * 10 + k];
+            if (wk == 0.0f) continue;
+            const int64_t r = slot[t * 10 + k];
+            const uint2 u = *reinterpret_cast<const uint2*>(Dm16 + (size_t) r * N + d);
+            const float v0 = __half2float(__ushort_as_half((uint16_t) (u.x & 0xFFFFu)));
+            const float v1 = __half2float(__ushort_as_half((uint16_t) (u.x >> 16)));
+            const float v2 = __half2float(__ushort_as_half((uint16_t) (u.y & 0xFFFFu)));
+            const float v3 = __half2float(__ushort_as_half((uint16_t) (u.y >> 16)));
+            s.x = fmaf(wk, v0, s.x); s.y = fmaf(wk, v1, s.y);
+            s.z = fmaf(wk, v2, s.z); s.w = fmaf(wk, v3, s.w);
+        }
+        const float4 shv = reinterpret_cast<const float4*>(shared)[t * (N / 4) + g4];
+        *reinterpret_cast<float4*>(s_bo + d) = make_float4(s.x + shv.x * g, s.y + shv.y * g, s.z + shv.z * g, s.w + shv.w * g);
+    }
+    __syncthreads();
+    for (int c = 0; c < HC; ++c) {
+        const int64_t row = t * HC + c;
+        float* r = R + row * N;
+        const int64_t xo = t * ldx + (int64_t) c * N;
+        const float sc = 2.0f * sigm(inj[t * inj_ld + c] / (float) HC);
+        float v[GRW_PER];
+        float ss = 0.0f;
+        int ki = 0;
+#pragma unroll
+        for (int d = threadIdx.x; d < N; d += 256, ++ki) {
+            const float x = fmaf(s_bo[d], sc, r[d]);
+            r[d] = x;
+            v[ki] = x;
+            ss += x * x;
+        }
+        const float rs = rsqrtf(block_sum(ss, sh) / (float) N + eps);
+        if (threadIdx.x == 0) rs_out[row] = rs;
+        ki = 0;
+#pragma unroll
+        for (int d = threadIdx.x; d < N; d += 256, ++ki) {
+            const float x = v[ki] * rs * w_norm[c * N + d];
+            const uint16_t h = act16(x);
+            xn16[xo + d] = f16img ? bf_to_hf_conv(h) : h;
+            if (xn16_lo) xn16_lo[xo + d] = bf_lo(x, h);
+        }
+    }
 }
 
 // ---------------------------------------------------------------- QSA helpers
@@ -2195,12 +2303,12 @@ __global__ void __launch_bounds__(256) gr_upmix_kernel(const uint16_t* __restric
                                                        const float* __restrict__ R, const float* __restrict__ rs,
                                                        const float* __restrict__ w, float* __restrict__ mixed,
                                                        uint16_t* __restrict__ mixed16, uint16_t* __restrict__ mixed_h,
-                                                       int64_t T) {
+                                                       int64_t T, int um_rep, int64_t mh_ld) {
     __shared__ __align__(16) uint16_t sB[HC * UM_D][UM_LD];
     const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5, l16 = lane & 15, hi = lane >> 4;
     // blocks ordered column-tile fastest: the blocks in flight share a token tile, so the epilogue's R reads run
     // along rows (token-tile fastest scattered them over 512 rows x 40 KB per block: 28 ms instead of 3.7 at 8K)
-    const int64_t t0 = (int64_t) blockIdx.y * UM_T + 16 * wave;
+    // t0 computed per rep tile below
     const int d0 = blockIdx.x * UM_D;
     for (int i = tid; i < HC * UM_D * (LR / 8); i += 256) {
         const int rr = i / (LR / 8), q = i % (LR / 8);
@@ -2208,7 +2316,11 @@ __global__ void __launch_bounds__(256) gr_upmix_kernel(const uint16_t* __restric
         *reinterpret_cast<uint4*>(&sB[rr][8 * q]) = *reinterpret_cast<const uint4*>(wu + (size_t) (c * N + d0 + dd) * LR + 8 * q);
     }
     __syncthreads();
-    if (t0 >= T) return;
+    for (int rep = 0; rep < um_rep; ++rep) {
+        const int64_t tile_t0 = ((int64_t) blockIdx.y * um_rep + rep) * UM_T;
+        if (tile_t0 >= T) break;
+        const int64_t t0 = tile_t0 + 16 * wave;
+        if (t0 >= T) continue;
     const int64_t ta = t0 + l16 < T ? t0 + l16 : T - 1;
     const uint16_t* arow = lo16 + ta * LR;
     um_f8 acc[HC];
@@ -2234,7 +2346,69 @@ __global__ void __launch_bounds__(256) gr_upmix_kernel(const uint16_t* __restric
         s /= (float) HC;
         mixed[t * N + d] = s;
         if (mixed16) mixed16[t * N + d] = act16(s);
-        if (mixed_h) mixed_h[t * N + d] = hf(s);
+        if (mixed_h) mixed_h[t * mh_ld + d] = hf(s);
+    }
+    }
+}
+
+__global__ void __launch_bounds__(256) gr_upmix_q8_0_kernel(const uint16_t* __restrict__ lo16,
+                                                            const uint8_t* __restrict__ wu_q8,
+                                                            const float* __restrict__ R,
+                                                            const float* __restrict__ rs,
+                                                            const float* __restrict__ w,
+                                                            float* __restrict__ mixed,
+                                                            uint16_t* __restrict__ mixed16,
+                                                            uint16_t* __restrict__ mixed_h,
+                                                            int64_t T,
+                                                            int um_rep, int64_t mh_ld) {
+    __shared__ __align__(16) uint16_t sB[HC * UM_D][UM_LD];
+    constexpr size_t row_bytes = (size_t) (LR / 32) * 34;
+    const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5, l16 = lane & 15, hi = lane >> 4;
+    const int d0 = blockIdx.x * UM_D;
+    for (int i = tid; i < HC * UM_D * (LR / 8); i += 256) {
+        const int rr = i / (LR / 8), q = i % (LR / 8);
+        const int c = rr / UM_D, dd = rr % UM_D;
+        const uint8_t* blk = wu_q8 + (size_t) (c * N + d0 + dd) * row_bytes + (size_t) (q >> 2) * 34;
+        const float d_scale = __half2float(__ushort_as_half((unsigned short) (blk[0] | (blk[1] << 8))));
+        const uint8_t* qs = blk + 2 + 8 * (q & 3);
+        __align__(16) uint16_t out8[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) out8[j] = bf(d_scale * (float) (int8_t) qs[j]);
+        *reinterpret_cast<uint4*>(&sB[rr][8 * q]) = *reinterpret_cast<const uint4*>(out8);
+    }
+    __syncthreads();
+    for (int rep = 0; rep < um_rep; ++rep) {
+        const int64_t tile_t0 = ((int64_t) blockIdx.y * um_rep + rep) * UM_T;
+        if (tile_t0 >= T) break;
+        const int64_t t0 = tile_t0 + 16 * wave;
+        if (t0 >= T) continue;
+        const int64_t ta = t0 + l16 < T ? t0 + l16 : T - 1;
+        const uint16_t* arow = lo16 + ta * LR;
+        um_f8 acc[HC];
+#pragma unroll
+        for (int c = 0; c < HC; ++c) acc[c] = um_f8{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+        for (int ks = 0; ks < LR; ks += 16) {
+            const um_b16 a = um_frag(arow + ks);
+#pragma unroll
+            for (int c = 0; c < HC; ++c) acc[c] = um_wmma(a, um_frag(&sB[c * UM_D + l16][ks]), acc[c]);
+        }
+        const int d = d0 + l16;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int64_t t = t0 + 2 * i + hi;
+            if (t >= T) continue;
+            float s = 0.0f;
+#pragma unroll
+            for (int c = 0; c < HC; ++c) {
+                const float x = R[t * D + c * N + d] * rs[t * HC + c] * w[c * N + d];
+                s = fmaf(x, sigm(acc[c][i]), s);
+            }
+            s /= (float) HC;
+            mixed[t * N + d] = s;
+            if (mixed16) mixed16[t * N + d] = act16(s);
+            if (mixed_h) mixed_h[t * mh_ld + d] = hf(s);
+        }
     }
 }
 #endif
@@ -2274,7 +2448,7 @@ __global__ void __launch_bounds__(256, 2) gr_upmix_cuda_kernel(const uint16_t* _
                                                               const float* __restrict__ w, float* __restrict__ mixed,
                                                               uint16_t* __restrict__ mixed16,
                                                               uint16_t* __restrict__ mixed_h,
-                                                              int64_t T) {
+                                                              int64_t T, int64_t mh_ld) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     __shared__ __align__(16) uint16_t sA[2][UC_BM][UC_LD];
     __shared__ __align__(16) uint16_t sB[2][HC * UC_BD][UC_LD];
@@ -2364,7 +2538,7 @@ __global__ void __launch_bounds__(256, 2) gr_upmix_cuda_kernel(const uint16_t* _
                     *reinterpret_cast<uint32_t*>(mixed16 + t * N + d) =
                         (uint32_t) act16(sm[0]) | ((uint32_t) act16(sm[1]) << 16);
                 if (mixed_h)
-                    *reinterpret_cast<uint32_t*>(mixed_h + t * N + d) = (uint32_t) hf(sm[0]) | ((uint32_t) hf(sm[1]) << 16);
+                    *reinterpret_cast<uint32_t*>(mixed_h + t * mh_ld + d) = (uint32_t) hf(sm[0]) | ((uint32_t) hf(sm[1]) << 16);
             }
         }
 #endif
@@ -2448,13 +2622,13 @@ void gr_norm_rs(const float* R, const float* w_norm, float eps, float* rs, uint1
     check("gr_norm_rs");
 }
 void gr_mix_r(const float* R, const float* rs, const float* w_norm, const float* gated, float* mixed, uint16_t* mixed16,
-              int64_t T, void* stream, uint16_t* mixed_h, uint16_t* mixed16_lo) {
+              int64_t T, void* stream, uint16_t* mixed_h, uint16_t* mixed16_lo, int64_t ld_mh) {
     gr_mix_r_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(R, rs, w_norm, gated, mixed, mixed16, T,
-                                                                          mixed_h, mixed16_lo);
+                                                                          mixed_h, mixed16_lo, ld_mh > 0 ? ld_mh : N);
     check("gr_mix_r");
 }
 bool gr_upmix(const uint16_t* lo16, const uint16_t* w_up, const float* R, const float* rs, const float* w_norm,
-              float* mixed, uint16_t* mixed16, uint16_t* mixed_h, int64_t T, void* stream) {
+              float* mixed, uint16_t* mixed16, uint16_t* mixed_h, int64_t T, void* stream, int64_t ld_mh) {
 #if defined(__HIPCC__)
     static const bool gfx11 = [] {
         int dev = 0;
@@ -2463,8 +2637,10 @@ bool gr_upmix(const uint16_t* lo16, const uint16_t* w_up, const float* R, const 
         return strata::kernels::gfx_arch_is_gfx11_wmma(p.gcnArchName);
     }();
     if (!gfx11 || T <= 0) return false;
-    gr_upmix_kernel<<<dim3(N / UM_D, (unsigned) ((T + UM_T - 1) / UM_T)), 256, 0, (cudaStream_t) stream>>>(
-        lo16, w_up, R, rs, w_norm, mixed, mixed16, mixed_h, T);
+    const int um_rep = T >= 4096 ? 8 : (T >= 1024 ? 4 : (T >= 256 ? 2 : 1));
+    const int64_t span = (int64_t) UM_T * um_rep;
+    gr_upmix_kernel<<<dim3(N / UM_D, (unsigned) ((T + span - 1) / span)), 256, 0, (cudaStream_t) stream>>>(
+        lo16, w_up, R, rs, w_norm, mixed, mixed16, mixed_h, T, um_rep, ld_mh > 0 ? ld_mh : N);
     check("gr_upmix");
     return true;
 #else
@@ -2479,9 +2655,33 @@ bool gr_upmix(const uint16_t* lo16, const uint16_t* w_up, const float* R, const 
     }
     if (ok_dev[dev] != 1) return false;
     gr_upmix_cuda_kernel<<<dim3(N / UC_BD, (unsigned) ((T + UC_BM - 1) / UC_BM)), 256, 0, (cudaStream_t) stream>>>(
-        lo16, w_up, R, rs, w_norm, mixed, mixed16, mixed_h, T);
+        lo16, w_up, R, rs, w_norm, mixed, mixed16, mixed_h, T, ld_mh > 0 ? ld_mh : N);
     check("gr_upmix");
     return true;
+#endif
+}
+bool gr_upmix_q8_0(const uint16_t* lo16, const void* w_up_q8, const float* R, const float* rs, const float* w_norm,
+                   const uint16_t* xn16, int64_t ldx, bool xf16, float* mixed, uint16_t* mixed16, uint16_t* mixed_h,
+                   int64_t T, void* stream, int64_t ld_mh) {
+    (void) xn16; (void) ldx; (void) xf16;
+#if defined(__HIPCC__)
+    static const bool gfx11 = [] {
+        int dev = 0;
+        cudaDeviceProp p;
+        if (cudaGetDevice(&dev) != cudaSuccess || cudaGetDeviceProperties(&p, dev) != cudaSuccess) return false;
+        return strata::kernels::gfx_arch_is_gfx11_wmma(p.gcnArchName);
+    }();
+    if (!gfx11 || T <= 0 || !w_up_q8) return false;
+    const int um_rep = T >= 4096 ? 8 : (T >= 1024 ? 4 : (T >= 256 ? 2 : 1));
+    const int64_t span = (int64_t) UM_T * um_rep;
+    gr_upmix_q8_0_kernel<<<dim3(N / UM_D, (unsigned) ((T + span - 1) / span)), 256, 0, (cudaStream_t) stream>>>(
+        lo16, static_cast<const uint8_t*>(w_up_q8), R, rs, w_norm, mixed, mixed16, mixed_h, T, um_rep, ld_mh > 0 ? ld_mh : N);
+    check("gr_upmix_q8_0");
+    return true;
+#else
+    (void) lo16; (void) w_up_q8; (void) R; (void) rs; (void) w_norm;
+    (void) mixed; (void) mixed16; (void) mixed_h; (void) T; (void) stream; (void) ld_mh;
+    return false;
 #endif
 }
 void gr_write_norm_rs(float* R, const float* bo, const float* inj, int64_t inj_ld, const float* w_norm_next, float eps,
@@ -2503,8 +2703,9 @@ void gr_silu(const float* lo, uint16_t* lo16, int64_t T, void* stream, uint16_t*
     check("gr_silu");
 }
 void gr_mix(const float* xn, const float* gated, float* mixed, uint16_t* mixed16, int64_t T, void* stream,
-            uint16_t* mixed_h, uint16_t* mixed16_lo) {
-    gr_mix_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(xn, gated, mixed, mixed16, T, mixed_h, mixed16_lo);
+            uint16_t* mixed_h, uint16_t* mixed16_lo, int64_t ld_mh) {
+    gr_mix_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(xn, gated, mixed, mixed16, T, mixed_h, mixed16_lo,
+                                                                        ld_mh > 0 ? ld_mh : N);
     check("gr_mix");
 }
 void gr_write(float* R, const float* bo, const float* inj, int64_t inj_ld, int64_t T, void* stream) {
@@ -2548,9 +2749,9 @@ void gdn_recurrence_variant(int variant, float* state, const float* h, const flo
     if (variant == 0 || variant == 1) {
         // STRATA_GDN_CHUNKED=1: the chunked recurrence on the gfx11 matrix cores, FP16 operands (default ON on gfx11 via arch_defaults,
         // disableable with STRATA_GDN_CHUNKED=0)
-        const char* v = std::getenv("STRATA_GDN_CHUNKED");
-        const bool chunked = (v != nullptr) && (std::atoi(v) != 0);
-        if (chunked && !serial && gdn_rec_wmma(state, h, gate, beta, z, gamma, eps, y, y16, T, (cudaStream_t) stream, ld16)) {
+        static const bool chunked = [] { const char* v = std::getenv("STRATA_GDN_CHUNKED"); return (v != nullptr) && (std::atoi(v) != 0); }();
+        static const int64_t gdn_min_t = [] { const char* v = std::getenv("STRATA_GDN_CHUNKED_MIN_T"); return (v != nullptr && v[0] != '\0') ? (int64_t) std::atoll(v) : kGdnWmmaMin; }();
+        if (chunked && !serial && T >= gdn_min_t && gdn_rec_wmma(state, h, gate, beta, z, gamma, eps, y, y16, T, (cudaStream_t) stream, ld16)) {
             check("gdn_recurrence (chunked, WMMA)");
             return;
         }
@@ -2693,9 +2894,11 @@ void copy_i32(int32_t* dst, const int32_t* src, int64_t n, void* stream) {
     copy_i32_kernel<<<(unsigned) (b < 256 ? b : 256), 256, 0, (cudaStream_t) stream>>>(dst, src, n);
     check("copy_i32");
 }
-void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int64_t n, int64_t width, void* stream) {
+void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int64_t n, int64_t width, void* stream,
+                   int64_t src_ld) {
     if (n <= 0) return;
-    gather_rows16_kernel<<<blocks_for(n * (width / 8)), 256, 0, (cudaStream_t) stream>>>(x16, src, dst16, n, width);
+    gather_rows16_kernel<<<blocks_for(n * (width / 8)), 256, 0, (cudaStream_t) stream>>>(x16, src, dst16, n, width,
+                                                                                         src_ld > 0 ? src_ld : width);
     check("gather_rows16");
 }
 namespace {
@@ -2814,6 +3017,31 @@ void moe_combine(const float* Dm, const int32_t* slot, const float* w, const flo
 #endif
     moe_combine_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, slot, w, shared, sg, bo, T, row_sd);
     check("moe_combine");
+}
+void moe_combine_f16(const uint16_t* Dm16, const int32_t* slot, const float* w, const float* shared, const float* sg,
+                     float* bo, int64_t T, void* stream) {
+    if (T <= 0) return;
+#ifndef STRATA_W_NO_COMB
+    if (((reinterpret_cast<uintptr_t>(Dm16) & 7) == 0) &&
+        (((reinterpret_cast<uintptr_t>(shared) | reinterpret_cast<uintptr_t>(bo)) & 15) == 0)) {
+        moe_combine_f16_4_kernel<<<blocks_for(T * (N / 4)), 256, 0, (cudaStream_t) stream>>>(
+            Dm16, slot, w, reinterpret_cast<const float4*>(shared), sg, reinterpret_cast<float4*>(bo), T);
+        check("moe_combine_f16");
+        return;
+    }
+#endif
+    moe_combine_f16_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm16, slot, w, shared, sg, bo, T);
+    check("moe_combine_f16");
+}
+void moe_combine_f16_write_norm_rs(float* R, const uint16_t* Dm16, const int32_t* slot, const float* w,
+                                   const float* shared, const float* sg, const float* inj, int64_t inj_ld,
+                                   const float* w_norm_next, float eps, float* rs, uint16_t* xn16, int64_t T,
+                                   void* stream, uint16_t* xn16_lo, int64_t ldx, bool f16img) {
+    if (T <= 0) return;
+    moe_combine_f16_write_norm_rs_kernel<<<(unsigned) T, 256, 0, (cudaStream_t) stream>>>(
+        R, Dm16, slot, w, shared, sg, inj, inj_ld, w_norm_next, eps, rs, xn16, xn16_lo,
+        ldx > 0 ? ldx : D, f16img ? 1 : 0, T);
+    check("moe_combine_f16_write_norm_rs");
 }
 void rms_rows(float* x, const float* w, int64_t rows, int64_t cols, int64_t ld, float eps, void* stream) {
     if (rows <= 0) return;

@@ -1877,7 +1877,7 @@ constexpr int PA_KL = 8;
 typedef _Float16 wh8 __attribute__((ext_vector_type(PA_KL)));
 typedef float wf8 __attribute__((ext_vector_type(8)));
 constexpr int WCH = 32;          // cells per chunk (two 16-cell tiles)
-constexpr int WVS = 80;          // staged V row stride in bytes (64 codes, 16-byte aligned, banks spread)
+constexpr int WVS = 64;          // staged V row stride in bytes (64 codes, 16-byte aligned; 19,600 B LDS -> 3 CTAs/CU on gfx11)
 struct alignas(16) SmemW {
     float part[4][16][WCH + 1];  // q.k per dim group
     float p[16][WCH + 1];
@@ -1903,8 +1903,21 @@ __device__ __forceinline__ wf8 wmma_f16(wh8 a, wh8 b, wf8 c) {
 
 __device__ __forceinline__ wh8 i8_to_h(const uint32_t* x) {   // PA_KL codes, exact: |code| <= 128
     wh8 h;
+#if STRATA_PA_WMMA
+    typedef _Float16 pa_fh2 __attribute__((ext_vector_type(2)));
+    const pa_fh2 bias = pa_fh2{(_Float16) -1152.0f, (_Float16) -1152.0f};
+#pragma unroll
+    for (int u = 0; u < PA_KL / 4; ++u) {
+        const uint32_t c = x[u] ^ 0x80808080u;
+        const pa_fh2 lo = __builtin_bit_cast(pa_fh2, __builtin_amdgcn_perm(0x64646464u, c, 0x04010400u)) + bias;
+        const pa_fh2 hi = __builtin_bit_cast(pa_fh2, __builtin_amdgcn_perm(0x64646464u, c, 0x04030402u)) + bias;
+        h[4 * u + 0] = lo[0]; h[4 * u + 1] = lo[1];
+        h[4 * u + 2] = hi[0]; h[4 * u + 3] = hi[1];
+    }
+#else
 #pragma unroll
     for (int i = 0; i < PA_KL; ++i) h[i] = (_Float16) (int) (int8_t) (x[i / 4] >> (8 * (i % 4)));
+#endif
     return h;
 }
 
@@ -1961,7 +1974,7 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_wmma_kernel(const float* 
             const float v = x[i] * qup;
             const _Float16 hi = (_Float16) v;
             qh[kk][i] = hi;
-            ql[kk][i] = (_Float16) (v - (float) hi);
+            if constexpr (SPLIT) ql[kk][i] = (_Float16) (v - (float) hi);
         }
     }
 
@@ -2094,7 +2107,7 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_wmma_kernel(const float* 
                     const float pv = S.p[col][cb + i] * (S.vs[warp][cb + i] * vup);
                     const _Float16 hi = (_Float16) pv;
                     ah[i] = hi;
-                    al[i] = (_Float16) (pv - (float) hi);
+                    if constexpr (SPLIT) al[i] = (_Float16) (pv - (float) hi);
                 }
 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
@@ -2119,10 +2132,25 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_wmma_kernel(const float* 
     };
     // all of a chunk's reads are issued before its compute (they were interleaved with the q.k WMMAs and the V
     // staging): 32K context, 2,048 queries, gfx1151, STRATA_PA_FAST=1: 12.49 -> 11.27 ms; the same bits
+    auto cell_of_w = [&](int ci) -> int {
+        const int idx = ci * WCH + lane;
+        return idx < n ? __ldg(ids + idx) : -1;
+    };
+    auto row_from_cell = [&](int cell) -> long long {
+        if (cell < 0) return -1;
+        const long long page = (long long) __ldg(p.page_table + cell / page_size);
+        return page >= 0 ? (page * n_kv_heads + kvh) * page_size + (cell % page_size) : -1;
+    };
+    int next_cell = n_chunks > 1 ? cell_of_w(1) : -1;
+    long long cur_row = n_chunks > 0 ? row_from_cell(cell_of_w(0)) : -1;
     for (int ci = 0; ci < n_chunks; ++ci) {
         Chunk d;
-        fetch(row_of(ci), d);
+        fetch(cur_row, d);
+        const long long next_row = (ci + 1 < n_chunks) ? row_from_cell(next_cell) : -1;
+        next_cell = (ci + 2 < n_chunks) ? cell_of_w(ci + 2) : -1;
+        (void) row_of;
         chunk(d);
+        cur_row = next_row;
     }
     float inv[8];
 #pragma unroll

@@ -223,6 +223,7 @@ struct PleTable::Impl {
     strata::ngram::PleReader::Ticket prefetch_tickets[kMaxPrefetch] = {};
     uint32_t prefetch_keys[kMaxPrefetch][PLE_N_HEADS] = {};
     uint8_t prefetch_raw[kMaxPrefetch][PLE_N_HEADS * PLE_ROW_BYTES_MAX] = {};
+    std::vector<uint8_t> batch_raw;   // reusable prefill gather_batch buffer (avoids 25 MB alloc+zero per chunk)
     float scale = 1.0f;               // the FP8 table's one scale
     uint32_t rb = PLE_ROW_BYTES;      // bytes per row
     void decode(const uint8_t* row, float* out160) const { fmt->dequant(row, scale, out160); }
@@ -440,6 +441,8 @@ void PleTable::close() {
     impl_->fmt = &ple_format_info(PleFormat::IQ4_NL);
     impl_->scale = 1.0f;
     impl_->bytes_read = 0;
+    impl_->batch_raw.clear();
+    impl_->batch_raw.shrink_to_fit();
 }
 
 bool PleTable::is_open() const { return impl_->data != nullptr || impl_->reader.is_open(); }
@@ -551,11 +554,29 @@ bool PleTable::gather_batch(const uint32_t* rows, size_t n_tokens, float* out, s
             }
         }
         wait_prefetches();
-        std::vector<uint8_t> raw(n * impl_->rb);
-        const auto ticket = impl_->reader.issue(rows, n, raw.data());
+        const size_t need_raw = n * impl_->rb;
+        if (impl_->batch_raw.size() < need_raw) impl_->batch_raw.resize(need_raw);
+        uint8_t* raw_ptr = impl_->batch_raw.data();
+        const auto ticket = impl_->reader.issue(rows, n, raw_ptr);
         if (!impl_->reader.collect(ticket, err)) return false;
-        for (size_t i = 0; i < n; ++i) impl_->decode(raw.data() + i * impl_->rb, out + i * PLE_HEAD_DIM);
-        impl_->bytes_read += (uint64_t) n * impl_->rb;
+        const uint32_t rb = impl_->rb;
+        if (n >= 8192) {
+            constexpr size_t kWorkers = 4;
+            const size_t chunk = (n + kWorkers - 1) / kWorkers;
+            std::thread workers[kWorkers - 1];
+            for (size_t w = 1; w < kWorkers; ++w) {
+                const size_t b0 = w * chunk, b1 = std::min(n, b0 + chunk);
+                workers[w - 1] = std::thread([this, raw_ptr, out, rb, b0, b1] {
+                    for (size_t i = b0; i < b1; ++i) impl_->decode(raw_ptr + i * rb, out + i * PLE_HEAD_DIM);
+                });
+            }
+            const size_t b1_0 = std::min(n, chunk);
+            for (size_t i = 0; i < b1_0; ++i) impl_->decode(raw_ptr + i * rb, out + i * PLE_HEAD_DIM);
+            for (size_t w = 1; w < kWorkers; ++w) workers[w - 1].join();
+        } else {
+            for (size_t i = 0; i < n; ++i) impl_->decode(raw_ptr + i * rb, out + i * PLE_HEAD_DIM);
+        }
+        impl_->bytes_read += (uint64_t) need_raw;
         return true;
     }
     wait_prefetches();

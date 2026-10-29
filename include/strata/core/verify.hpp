@@ -530,6 +530,8 @@ private:
     int64_t n_vocab_ = 0;
     cudaStream_t cs_ = nullptr;
     cudaStream_t sh_cs_ = nullptr;
+    cudaStream_t alt_cs_ = nullptr;     // STRATA_WDDM_ALT_STREAM=1: alternate stream for WDDM queue stall reduction
+    bool wddm_alt_stream_ = false;
     cudaEvent_t ev_fork_ = nullptr, ev_join_ = nullptr;
     // STRATA_DF_BRANCH: a layer's mixer work that reads only the layer's input, captured as parallel graph branches
     // on these side streams (record_window); the same kernels on the same inputs, only their order is freer
