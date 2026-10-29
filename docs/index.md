@@ -14,10 +14,14 @@ Standard: OpenAI Harness Engineering & Matklad `ARCHITECTURE.md` Progressive Dis
 
 ---
 
-## 2. Qwen 3.8 Flash-Next 177B on AMD Strix Halo — Pass 7 Validation & Dossiers
+## 2. Qwen 3.8 Flash-Next 177B on AMD Strix Halo — Pass 9.1 Champion & Validation Dossiers
 Read these documents in order for our custom Windows 11 AMD Strix Halo (`Ryzen AI Max+ 395 / Radeon 8060S gfx1151`, `128 GB` LPDDR5X) engineering work:
 
-1. **[GUFO.md](./GUFO.md) (Gufo AI Engine Architecture & Cross-Reference)**:
+1. **[PASS9_1_STRATA_GUFO_SUMMARY.md](./PASS9_1_STRATA_GUFO_SUMMARY.md) (Authoritative Pass 9.1 Champion State — 2026-10-29)**:
+   - Documents the active Pass 9.1 Champion (`strata.exe` `a621538b...`): single-pass FP16 WMMA MoE prefill (`743.4–1,496.7 tok/s`), coupled `--spec 7` MTP decode (`81.8–90.5 tok/s` client / `79.7–87.9 tok/s` engine), Gufo WDDM/IOCP adoptions, and `48.92 GiB` combined free Unified Memory (`32.81 GiB` UMA VRAM + `16.11 GiB` OS RAM).
+2. **[STRATA_GUFO_PERFORMANCE_PATH_2026-10-29.md](./STRATA_GUFO_PERFORMANCE_PATH_2026-10-29.md) & [STRATA_GUFO_PREFILL_IMPLEMENTATION_PLAN_2026-10-29.md](./STRATA_GUFO_PREFILL_IMPLEMENTATION_PLAN_2026-10-29.md)**:
+   - Architectural path and prefill kernel design analysis bridging Strata and Gufo on `gfx1151`.
+3. **[GUFO.md](./GUFO.md) (Gufo AI Engine Architecture & Cross-Reference)**:
    - Comprehensive technical architecture, model coverage (Qwen 3.8 27B/Flash-Next, DeepSeek V4 Flash, Qwen3-ASR/TTS, EmbeddingGemma-2, MiniMax H3), Windows TheRock 10.0.0 build guide, and architectural cross-pollination with Strata (PR #850 lossy DeltaNet removal, Pixmaate WDDM alternating stream, and thread-local OVERLAPPED handles).
 2. **[PASS7_FINAL_VALIDATION_REPORT.md](./PASS7_FINAL_VALIDATION_REPORT.md) (Authoritative Current State — 2026-10-28)**:
    - Complete Pass 7 production validation report (`branch pass7/gfx1151-v0145-opt`, `29 PASS / 0 WARN / 0 FAIL` on `audit-config`).

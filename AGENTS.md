@@ -51,6 +51,9 @@ Pass 9.1 establishes single-pass FP16 WMMA MoE prefill and coupled `--spec 7` MT
   - 4096 tok (4,254 prompt): Prefill 1,367.8 tok/s (`TTFT = 3,214.8 ms`), Decode 90.5 tok/s (Client) / 87.9 tok/s (Engine), 84.2% draft acceptance
   - 8192 tok (8,732 prompt): Prefill 1,449.1 tok/s (`TTFT = 6,136.2 ms`), Decode 87.2 tok/s (Client) / 84.6 tok/s (Engine), 82.8% draft acceptance
   - 16384 tok (17,612 prompt): Prefill 1,496.7 tok/s (`PP = 1,499.6 tok/s`, `TTFT = 11,879.1 ms`), Decode 85.1 tok/s (Client) / 82.7 tok/s (Engine), 83.7% draft acceptance
+- **Unified Memory Headroom (128 GB LPDDR5X UMA: 96 GiB GPU Carveout + 31.65 GiB OS RAM)**:
+  - **UMA GPU VRAM**: `33,594 MiB` (`32.81 GiB`) free at handshake (`33,454 MiB` / `32.67 GiB` during decode with all `24,576` experts in `55.43 GiB` VRAM), leaving room to run `Qwen3.6-35B-A3B` concurrently.
+  - **Host Physical OS RAM**: `STRATA_FILE_RELEASE=1` hands `55.15 GiB` of expert mmap pages back to Windows (`strata.exe` working set `2.02 GiB`, `16.1–21.0 GiB` OS RAM free; `~48.9+ GiB` combined free unified memory).
 - **Validation**:
   - `audit-config`: 39 PASS, 0 WARN, 0 FAIL.
   - `verify-thinking`: Overall Verdict: true (multi-turn KV cache prefix preservation verified across effort levels).
@@ -58,4 +61,5 @@ Pass 9.1 establishes single-pass FP16 WMMA MoE prefill and coupled `--spec 7` MT
 
 <!-- MEMOHARNESS:BEGIN -->
 # Curated MemoHarness Rules
+- **AVOID PAST FAILURE [pass91_champion_lock]**: Keep Pass 9.1 (`strata.exe` `a621538b...`, `strata-server.exe` `3b24e099...`) as active champion; Pass 10/11 experimental builds regressed sub-1024 prefill (`640 vs 757.8 tok/s`) or mid-tier decode and are archived off-path (`.bak_pass10` / `.bak_pass11`).
 <!-- MEMOHARNESS:END -->
