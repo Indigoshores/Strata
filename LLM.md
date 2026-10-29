@@ -30,7 +30,7 @@ Operational Fast Router for AI Agents.
 - **Strix Halo Go Toolchain (`docs-strix-go/`)**:
   - `main.go`, `validator.go`, `benchmark.go`, `thinking_verify.go`: Pure Go 1.26 validation CLI (`strata-tracker.exe`).
 - **Production Runtime (`C:\Users\Butch\Documents\10-Models\Strata\`)**:
-  - `strata-qwen177b.json`: Active Pass 7 production runtime configuration (Port `8080`, co-resident with `llama-server.exe` Qwen 3.6 35B on Port `8081`).
+  - `strata-qwen177b.json`: Active Pass 9.1 Champion runtime configuration (`strata.exe` `a621538b...`, Port `8080`, `33,594 MiB` / `32.81 GiB` free UMA VRAM + `16.1–21.0 GiB` free OS RAM for Port `8081` `Qwen 3.6 35B` coexistence).
 
 ---
 
@@ -52,8 +52,8 @@ go -C C:\Users\Butch\Documents\02_Apps\Strata\docs-strix-go build -o strata-trac
 
 ---
 
-## 4. HARD INVARIANTS (PASS 7 PRODUCTION)
-1. **Fail-Closed Prefill Guards**: `STRATA_PREFILL_STREAM_MIN=16` (`<= 128`), `STRATA_PF_FUSED=1`, `STRATA_PF_GEMM=1`, `STRATA_WMMA_GEMM=1`, `STRATA_PF_HCDOWN=1`, `STRATA_PF_PAD=1`, and `STRATA_PF_SWITCH_MIN_T=128` (`16..256`) MUST remain active in `strata-qwen177b.json`.
-2. **Forbidden Switches on `gfx1151` Windows WDDM**: `STRATA_PF_F16=0` (or absent; `=1` causes a `7.12x` MoE slowdown), `STRATA_SH_STREAM=0` on Windows WDDM (`+16.4%` decode gain vs `1`), and `STRATA_HC_PERSIST=0` (inert on `gfx1151`).
-3. **Thinking & Tail-Role Checkpoint Invariant**: Default `reasoning_effort="medium"`, `effort_position="end"`, `--tail-role-token 8678`, `--spec 7`, `--mtp-q4 head`, and `--coupled-draft`; `reasoning_effort="none"` is forbidden in benchmarks.
-4. **Dual-Server UMA Coexistence**: Port `8080` (`strata.exe`, 177B, `24,576` GPU expert slots) and Port `8081` (`llama-server.exe`, Qwen 3.6 35B) co-reside in `128 GB` UMA with `STRATA_FILE_RELEASE=1` preserving `>20 GiB` free OS RAM.
+## 4. HARD INVARIANTS (PASS 9.1 CHAMPION)
+1. **Single-Pass FP16 WMMA Prefill Guards**: `STRATA_NO_TURN_SPLIT=1`, `STRATA_PF_F16=1`, `STRATA_PF_F16_MIN_T=0`, `STRATA_PF_MOE_SCATTER=0`, `STRATA_PF_DM_F16=1`, `STRATA_GDN_CHUNKED=1`, `STRATA_GDN_CHUNKED_MIN_T=128`, `STRATA_PREFILL_STREAM_MIN=16`, and `STRATA_PF_SWITCH_MIN_T=16` MUST remain active in `strata-qwen177b.json` (`39/39 PASS` on `audit-config`).
+2. **Forbidden Switches on `gfx1151` Windows WDDM**: `STRATA_SH_STREAM=0` (`STRATA_PF_SH_STREAM=0`, `STRATA_PF_Z_STREAM=0`), `STRATA_PF_MOE_SCATTER=0` (`=1` overrides `Dm` FP16 and adds `+80.5 GB` DRAM traffic at 16K), and never allocate the `26.82 GiB` PLE table in VRAM (must stream via Direct NVMe I/O).
+3. **Thinking & Coupled MTP Spec-7 Invariant**: Default `reasoning_effort="medium"`, `effort_position="end"`, `--tail-role-token 8678`, `--prefill 18432`, `--spec 7`, `--lookup-chain 3`, and `--mtp-q4 head`; `reasoning_effort="none"` is forbidden in benchmarks.
+4. **Unified Memory Headroom & Coexistence**: Port `8080` (`strata.exe`, 177B, `24,576` GPU expert slots in `55.43 GiB` VRAM) leaves `33,594 MiB` (`32.81 GiB`) free UMA VRAM and `16.1–21.0 GiB` free OS RAM (`STRATA_FILE_RELEASE=1`, `2.02 GiB` working set) to co-reside with `Qwen 3.6 35B` on Port `8081`.

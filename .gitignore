@@ -66,3 +66,12 @@ build-vision-cuda12.bat
 dist-hip/
 # isolated test and benchmark harness / staging
 /.harness/
+
+# Antigravity / gograph AST caches & local Go CLI build outputs
+.gograph/
+.code-graph-cache/
+.agents/
+graphify-out/
+docs-strix-go/*.exe
+docs-strix-go/*.json
+docs-strix-go/*.log
