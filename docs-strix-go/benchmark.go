@@ -238,7 +238,8 @@ type chatCompletionRequest struct {
 	Seed            int                    `json:"seed"`
 	Stream          bool                   `json:"stream"`
 	ReasoningEffort string                 `json:"reasoning_effort,omitempty"`
-	StreamOptions   map[string]interface{} `json:"stream_options,omitempty"`
+	StreamOptions    map[string]interface{} `json:"stream_options,omitempty"`
+	StrataCheckpoint *bool                  `json:"strata_checkpoint,omitempty"`
 }
 
 type chatMessage struct {
@@ -260,6 +261,8 @@ type sseChunk struct {
 		TotalTokens      int `json:"total_tokens"`
 	} `json:"usage,omitempty"`
 }
+
+func boolPtr(v bool) *bool { return &v }
 
 // ValidateReasoningEffort enforces the hard invariant that reasoning_effort="none" is strictly forbidden.
 func ValidateReasoningEffort(reasoning string) (string, error) {
@@ -345,7 +348,8 @@ func RunSingleHTTPBenchmark(ctx context.Context, serverURL, engineLogPath, promp
 		Seed:            42,
 		Stream:          true,
 		ReasoningEffort: reasoning,
-		StreamOptions:   map[string]interface{}{"include_usage": true},
+		StreamOptions:    map[string]interface{}{"include_usage": true},
+		StrataCheckpoint: boolPtr(false),
 	}
 
 	payload, err := json.Marshal(reqBody)
@@ -661,6 +665,57 @@ func killProcessesByName(names ...string) {
 	}
 }
 
+func isWin32PIDAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	k32 := syscall.NewLazyDLL("kernel32.dll")
+	openProc := k32.NewProc("OpenProcess")
+	getExit := k32.NewProc("GetExitCodeProcess")
+	closeH := k32.NewProc("CloseHandle")
+	const processQueryLimitedInfo = 0x1000
+	const stillActive = 259
+	h, _, _ := openProc.Call(processQueryLimitedInfo, 0, uintptr(pid))
+	if h == 0 {
+		return false
+	}
+	defer closeH.Call(h)
+	var code uint32
+	r, _, _ := getExit.Call(h, uintptr(unsafe.Pointer(&code)))
+	return r != 0 && code == stillActive
+}
+
+func startDetachedEscapeJobWMI(exePath string, args []string, workDir string) (int, error) {
+	quoteCmdArg := func(s string) string {
+		return `"` + strings.ReplaceAll(s, `"`, `\"`) + `"`
+	}
+	parts := []string{quoteCmdArg(exePath)}
+	for _, a := range args {
+		parts = append(parts, quoteCmdArg(a))
+	}
+	cmdLine := strings.Join(parts, " ")
+	psQuote := func(s string) string {
+		return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+	}
+	psScript := fmt.Sprintf(
+		`$si = New-CimInstance -ClientOnly -ClassName Win32_ProcessStartup -Property @{ ShowWindow = [uint16]0 }; `+
+			`$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = %s; CurrentDirectory = %s; ProcessStartupInformation = $si }; `+
+			`if ($r.ReturnValue -eq 0) { Write-Output $r.ProcessId } else { exit 1 }`,
+		psQuote(cmdLine),
+		psQuote(workDir),
+	)
+	out, err := exec.Command("powershell.exe", "-NoProfile", "-Command", psScript).Output()
+	if err != nil {
+		return 0, err
+	}
+	var pid int
+	_, _ = fmt.Sscanf(strings.TrimSpace(string(out)), "%d", &pid)
+	if pid <= 0 {
+		return 0, fmt.Errorf("unexpected empty PID from Win32_Process.Create")
+	}
+	return pid, nil
+}
+
 // RestartStrataServer stops the running strata-server.exe / strata.exe processes, waits for UMA VRAM release,
 // launches strata-server.exe with the updated strata-qwen177b.json (including STRATA_PREFILL_STREAM_MIN=128),
 // and polls GET /health until loaded=true.
@@ -752,6 +807,48 @@ func RestartStrataServer(ctx context.Context, serverURL, runtimeDir string, extr
 		return 0, fmt.Errorf("failed opening %s: %w", errLogPath, err)
 	}
 
+	wmiArgs := append([]string{"-server-log", errLogPath}, args...)
+	if wmiPid, wmiErr := startDetachedEscapeJobWMI(serverExe, wmiArgs, runtimeDir); wmiErr == nil && wmiPid > 0 {
+		_ = outFile.Close()
+		_ = errFile.Close()
+		fmt.Printf("      Spawned PID=%d via WMI job-escaped daemon\n", wmiPid)
+		go func(pid int) {
+			for {
+				time.Sleep(1 * time.Second)
+				if !isWin32PIDAlive(pid) {
+					procExitCh <- fmt.Errorf("process %d exited", pid)
+					return
+				}
+			}
+		}(wmiPid)
+	} else {
+		cmd := exec.Command(serverExe, args...)
+		cmd.Dir = runtimeDir
+		cmd.Stdout = outFile
+		cmd.Stderr = errFile
+		cmd.SysProcAttr = &syscall.SysProcAttr{
+			CreationFlags: 0x01000000 | 0x00000200 | 0x00000008,
+		}
+		if err := cmd.Start(); err != nil {
+			cmd = exec.Command(serverExe, args...)
+			cmd.Dir = runtimeDir
+			cmd.Stdout = outFile
+			cmd.Stderr = errFile
+			cmd.SysProcAttr = &syscall.SysProcAttr{
+				CreationFlags: 0x00000200 | 0x00000008,
+			}
+			if errRetry := cmd.Start(); errRetry != nil {
+				_ = outFile.Close()
+				_ = errFile.Close()
+				return 0, fmt.Errorf("failed to start strata-server.exe: %w (fallback: %v)", err, errRetry)
+			}
+		}
+		fmt.Printf("      Spawned PID=%d\n", cmd.Process.Pid)
+		go func() {
+			procExitCh <- cmd.Wait()
+		}()
+	}
+	if false { // preserve legacy anchor below cleanly
 	cmd := exec.Command(serverExe, args...)
 	cmd.Dir = runtimeDir
 	cmd.Stdout = outFile
@@ -780,6 +877,7 @@ func RestartStrataServer(ctx context.Context, serverURL, runtimeDir string, extr
 		procExitCh <- cmd.Wait()
 	}()
 
+	}
 	fmt.Println("[4/4] Polling GET /health until 24,576 experts load into UMA VRAM (~135s)...")
 	startWait := time.Now()
 	healthURL := strings.TrimRight(serverURL, "/") + "/health"
@@ -819,17 +917,18 @@ func RestartStrataServer(ctx context.Context, serverURL, runtimeDir string, extr
 				warmupCtx, warmupCancel := context.WithTimeout(context.Background(), 60*time.Second)
 				defer warmupCancel()
 
-				warmupNonce := BuildZeroReusePrompt(128, fmt.Sprintf("%d", time.Now().UnixNano()))
+				warmupNonce := BuildZeroReusePrompt(512, fmt.Sprintf("T512_%d", time.Now().UnixNano()%1000000))
 				warmupBody := chatCompletionRequest{
 					Model: "qwen3.8-flash-next-177b",
 					Messages: []chatMessage{
 						{Role: "user", Content: warmupNonce},
 					},
-					MaxTokens:       16,
+					MaxTokens:        32,
 					Temperature:     0,
 					Seed:            42,
 					Stream:          false,
-					ReasoningEffort: "medium",
+					ReasoningEffort:  "medium",
+					StrataCheckpoint: boolPtr(false),
 				}
 				wPayload, wErr := json.Marshal(warmupBody)
 				if wErr == nil {

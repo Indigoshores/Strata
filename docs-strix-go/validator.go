@@ -34,6 +34,7 @@ type ProductionConfig struct {
 	Sampling        SamplingConfig    `json:"sampling"`
 	ReasoningEffort string            `json:"reasoning_effort,omitempty"`
 	EffortPosition  string            `json:"effort_position,omitempty"`
+	PreOpenThink    bool              `json:"pre_open_think,omitempty"`
 	Tokenizer   string            `json:"tokenizer"`
 	LibDirs     []string          `json:"lib_dirs"`
 	Env         map[string]string `json:"env"`
@@ -313,6 +314,21 @@ func AuditConfig(configPath, repoRoot string) (*ConfigAuditReport, error) {
 		addCheck("CFG-10c", "Thinking Alignment", "reasoning_effort valid", "FAIL", "low, medium, high, xhigh", effort, "Reasoning effort 'none' is forbidden as default production profile")
 	default:
 		addCheck("CFG-10c", "Thinking Alignment", "reasoning_effort valid", "WARN", "medium", effort, "Unrecognized reasoning effort setting")
+	}
+
+	// 3e. Check Effort Position & Zero PreOpenThink Alignment for Qwen 3.8 177B Pass 9.1 Parity
+	effortPos := strings.ToLower(strings.TrimSpace(cfg.EffortPosition))
+	if effortPos == "" {
+		effortPos = "end"
+	}
+	if strings.Contains(strings.ToLower(cfg.ModelName), "177b") || strings.Contains(strings.ToLower(cfg.ModelName), "qwen 3.8") {
+		if effortPos == "end" && !cfg.PreOpenThink {
+			addCheck("CFG-10d", "Thinking Alignment", "effort_position == end && pre_open_think == false", "PASS", "end (pre_open_think=false)", fmt.Sprintf("%s (pre_open_think=%v)", effortPos, cfg.PreOpenThink),
+				"Matches Pass 9.1 Reference (--tail-role-token 8678 + native <think> generation, 81.8-90.5 tok/s)")
+		} else {
+			addCheck("CFG-10d", "Thinking Alignment", "effort_position == end && pre_open_think == false", "FAIL", "end (pre_open_think=false)", fmt.Sprintf("%s (pre_open_think=%v)", effortPos, cfg.PreOpenThink),
+				"Qwen 3.8 177B requires effort_position='end' (--tail-role-token 8678) without PreOpenThink tag inflation")
+		}
 	}
 
 	// 4. Validate CLI Args (PLE Direct I/O, Expert Cache, KV Int8, MTP + Lookup Chain)
