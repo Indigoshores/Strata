@@ -67,3 +67,36 @@
 - gufo.blog + gufo-org/gufo: REAL (1,702.93 pp / 65.25 tg on Q4_K_XL, 128 GB machine).
 - v0.2.9 release notes: REAL numbers (8K UD-IQ4_XS 794 -> 1,243) but the mechanism is PF_F16 + HC_Q8 + SELECT_WMMA on Windows gfx1151 (already active in Arm D), NOT the gfx12-only N=64 chunk threshold.
 - xenodeve/Strata-xeno: REAL fork but NVIDIA multi-GPU; short-prompt bypass already covered natively by `--short-read 15`.
+
+## 7. RESULTS (executed 2026-11-04, same-session control P1-16: prefill mean 1,301.0 / cold-512 905.5 / decode mean 61.2 tok/s)
+
+Adoption gate per arm: prefill mean > +2% (>= 1,327), byte-exact parity at 88/512/1024, decode mean >= 59. Arms ran sequentially on Port 8080 (single 96 GiB UMA residency) via `ab_bench -mode restart` with per-arm config clones of `strata-qwen177b.json`.
+
+| Arm | Change | Prefill Mean | Decode Mean | Parity 88/512/1024 | Verdict |
+|:---|:---|:---|:---|:---|:---|
+| P1-16 | control (STREAM_MIN=16) | 1,301.0 | 61.2 | EXACT x3 | BASELINE |
+| P1-64 | STREAM_MIN=64 | 1,290.4 | — | EXACT x3 | REJECT (-0.8%) |
+| P1-128 | STREAM_MIN=128 | 1,285.4 | — | FAIL 88-tok (SHA d562787fd3ea) | REJECT (parity break: fused-expert MMQ summation-order flip in 117-128 tok band) |
+| P1-256 | STREAM_MIN=256 | 1,290.7 | — | FAIL 88-tok (same SHA) | REJECT |
+| P2-mmap | ple-io mmap | 1,290.8 | — | EXACT x3 | REJECT (no gain; cold gap is HIP graph capture + row-cache fill, not PLE I/O) |
+| P2-rc2m | row-cache 2M + KEEPALIVE=50 | 1,285.1 | — | EXACT x3 | REJECT |
+| P3-densemmq | STRATA_DENSE_MMQ=1 | 1,300.5 | 59.4 | EXACT x3 | REJECT (-0.5, noise) |
+| P3-switchmin32 | PF_SWITCH_MIN_T=32 | 1,287.2 | 62.9 | EXACT x3 | REJECT (prefill -13.8) |
+
+Key discovery (P2): Gufo-style async PLE pre-staging ALREADY EXISTS natively (`include/strata/ngram/ple_reader.hpp` issue()/collect() + `STRATA_SSD_KEEPALIVE` default 100). No port needed.
+
+## Arm A4 Results — SELECT_WMMA long-context audit (2026-11-04)
+
+Greedy (temp 0) 128-token completions, SHA-256 of completion text, `STRATA_SELECT_WMMA=1` (production) vs `=0`:
+
+| Prompt Tok | SWMA=1 SHA | SWMA=0 SHA | Result |
+|:---|:---|:---|:---|
+| 5,464 | 7e520eec41d3 | 26b452db6a76 | DIVERGED (SWMA=0 dropped final 2 tokens " six." — greedy argmax near-tie flip; semantically identical summary) |
+| 10,700 | 7e520eec41d3 | 7e520eec41d3 | IDENTICAL |
+| 21,312 | 7e520eec41d3 | 7e520eec41d3 | IDENTICAL |
+
+Long-context prefill throughput effectively identical between arms (~1,362-1,428 tok/s at 10.7K/21.3K). **DECISION: ACCEPT-RISK — keep `STRATA_SELECT_WMMA=1` in production.** Divergence is a stochastic numerics-tie artifact (matches upstream ~10/2,051 cell-flip note), semantically null, non-monotonic in context length; no throughput tradeoff either way.
+
+## 8. FINAL VERDICT
+
+**Arm D is at the local optimum for config-level prefill tuning on gfx1151.** No Gufo-style port beat the same-session control; the full C++ WMMA tile-rewrite port is NOT justified (30-60 min HIP rebuild risk for zero measured upside). Production config `strata-qwen177b.json` unchanged. Branch `feat/qwen38-prefill-ports` retained as documentation of the negative results.
